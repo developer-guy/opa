@@ -243,16 +243,14 @@ func NewCompiler() *Compiler {
 		// load additional modules. If any stages run before resolution, they
 		// need to be re-run after resolution.
 		{"ResolveRefs", "compile_stage_resolve_refs", c.resolveAllRefs},
-
+		{"SetModuleTree", "compile_stage_set_module_tree", c.setModuleTree},
+		{"SetRuleTree", "compile_stage_set_rule_tree", c.setRuleTree},
 		// The local variable generator must be initialized after references are
 		// resolved and the dynamic module loader has run but before subsequent
 		// stages that need to generate variables.
 		{"InitLocalVarGen", "compile_stage_init_local_var_gen", c.initLocalVarGen},
-
 		{"RewriteLocalVars", "compile_stage_rewrite_local_vars", c.rewriteLocalVars},
 		{"RewriteExprTerms", "compile_stage_rewrite_expr_terms", c.rewriteExprTerms},
-		{"SetModuleTree", "compile_stage_set_module_tree", c.setModuleTree},
-		{"SetRuleTree", "compile_stage_set_rule_tree", c.setRuleTree},
 		{"SetGraph", "compile_stage_set_graph", c.setGraph},
 		{"RewriteComprehensionTerms", "compile_stage_rewrite_comprehension_terms", c.rewriteComprehensionTerms},
 		{"RewriteRefsInHead", "compile_stage_rewrite_refs_in_head", c.rewriteRefsInHead},
@@ -809,7 +807,10 @@ func (c *Compiler) checkBodySafety(safe VarSet, m *Module, b Body) Body {
 	return reordered
 }
 
-var safetyCheckVarVisitorParams = VarVisitorParams{
+// SafetyCheckVisitorParams defines the AST visitor parameters to use for collecting
+// variables during the safety check. This has to be exported because it's relied on
+// by the copy propagation implementation in topdown.
+var SafetyCheckVisitorParams = VarVisitorParams{
 	SkipRefCallHead: true,
 	SkipClosures:    true,
 }
@@ -821,7 +822,7 @@ func (c *Compiler) checkSafetyRuleHeads() {
 	for _, name := range c.sorted {
 		m := c.Modules[name]
 		WalkRules(m, func(r *Rule) bool {
-			safe := r.Body.Vars(safetyCheckVarVisitorParams)
+			safe := r.Body.Vars(SafetyCheckVisitorParams)
 			safe.Update(r.Head.Args.Vars())
 			unsafe := r.Head.Vars().Diff(safe)
 			for v := range unsafe {
@@ -1599,7 +1600,8 @@ func getComprehensionIndex(arity func(Ref) int, candidates VarSet, expr *Expr) *
 	}
 
 	outputs := outputVarsForBody(body, arity, ReservedVars)
-	unsafe := body.Vars(safetyCheckVarVisitorParams).Diff(outputs).Diff(ReservedVars)
+	unsafe := body.Vars(SafetyCheckVisitorParams).Diff(outputs).Diff(ReservedVars)
+
 	if len(unsafe) > 0 {
 		return nil
 	}
@@ -1607,20 +1609,30 @@ func getComprehensionIndex(arity func(Ref) int, candidates VarSet, expr *Expr) *
 	// Similarly, ignore comprehensions that contain references with output variables
 	// that intersect with the candidates. Indexing these comprehensions could worsen
 	// performance.
-	vis := newComprehensionIndexRegressionCheckVisitor(candidates)
-	vis.Walk(body)
-	if vis.worse {
+	regressionVis := newComprehensionIndexRegressionCheckVisitor(candidates)
+	regressionVis.Walk(body)
+	if regressionVis.worse {
 		return nil
 	}
 
-	indexVars := candidates.Intersect(outputs)
-	if len(indexVars) == 0 {
+	// Check if any nested comprehensions close over candidates. If any intersection is found
+	// the comprehension cannot be cached because it would require closing over the candidates
+	// which the evaluator does not support today.
+	nestedVis := newComprehensionIndexNestedCandidateVisitor(candidates)
+	nestedVis.Walk(body)
+	if nestedVis.found {
 		return nil
 	}
 
 	// Make a sorted set of variable names that will serve as the index key set.
 	// Sort to ensure deterministic indexing. In future this could be relaxed
-	// if we can decide that one ordering is better than another.
+	// if we can decide that one ordering is better than another. If the set is
+	// empty, there is no indexing to do.
+	indexVars := candidates.Intersect(outputs)
+	if len(indexVars) == 0 {
+		return nil
+	}
+
 	result := make([]*Term, 0, len(indexVars))
 
 	for v := range indexVars {
@@ -1689,6 +1701,38 @@ func (vis *comprehensionIndexRegressionCheckVisitor) assertEmptyIntersection(vs 
 	}
 }
 
+type comprehensionIndexNestedCandidateVisitor struct {
+	candidates VarSet
+	nested     bool
+	found      bool
+}
+
+func newComprehensionIndexNestedCandidateVisitor(candidates VarSet) *comprehensionIndexNestedCandidateVisitor {
+	return &comprehensionIndexNestedCandidateVisitor{
+		candidates: candidates,
+	}
+}
+
+func (vis *comprehensionIndexNestedCandidateVisitor) Walk(x interface{}) {
+	NewGenericVisitor(vis.visit).Walk(x)
+}
+
+func (vis *comprehensionIndexNestedCandidateVisitor) visit(x interface{}) bool {
+
+	if vis.found {
+		return true
+	}
+
+	if v, ok := x.(Value); ok && IsComprehension(v) {
+		varVis := NewVarVisitor().WithParams(VarVisitorParams{SkipRefHead: true})
+		varVis.Walk(v)
+		vis.found = len(varVis.Vars().Intersect(vis.candidates)) > 0
+		return true
+	}
+
+	return false
+}
+
 // ModuleTreeNode represents a node in the module tree. The module
 // tree is keyed by the package path.
 type ModuleTreeNode struct {
@@ -1752,6 +1796,7 @@ type TreeNode struct {
 	Key      Value
 	Values   []util.T
 	Children map[Value]*TreeNode
+	Sorted   []Value
 	Hide     bool
 }
 
@@ -1771,8 +1816,10 @@ func NewRuleTree(mtree *ModuleTreeNode) *TreeNode {
 
 	// Each rule set becomes a leaf node.
 	children := map[Value]*TreeNode{}
+	sorted := make([]Value, 0, len(ruleSets))
 
 	for key, rules := range ruleSets {
+		sorted = append(sorted, key)
 		children[key] = &TreeNode{
 			Key:      key,
 			Children: nil,
@@ -1781,14 +1828,20 @@ func NewRuleTree(mtree *ModuleTreeNode) *TreeNode {
 	}
 
 	// Each module in subpackage becomes child node.
-	for _, child := range mtree.Children {
+	for key, child := range mtree.Children {
+		sorted = append(sorted, key)
 		children[child.Key] = NewRuleTree(child)
 	}
+
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].Compare(sorted[j]) < 0
+	})
 
 	return &TreeNode{
 		Key:      mtree.Key,
 		Values:   nil,
 		Children: children,
+		Sorted:   sorted,
 		Hide:     mtree.Hide,
 	}
 }
@@ -1824,6 +1877,7 @@ func (n *TreeNode) DepthFirst(f func(node *TreeNode) bool) {
 // Graph represents the graph of dependencies between rules.
 type Graph struct {
 	adj    map[util.T]map[util.T]struct{}
+	radj   map[util.T]map[util.T]struct{}
 	nodes  map[util.T]struct{}
 	sorted []util.T
 }
@@ -1834,6 +1888,7 @@ func NewGraph(modules map[string]*Module, list func(Ref) []*Rule) *Graph {
 
 	graph := &Graph{
 		adj:    map[util.T]map[util.T]struct{}{},
+		radj:   map[util.T]map[util.T]struct{}{},
 		nodes:  map[util.T]struct{}{},
 		sorted: nil,
 	}
@@ -1879,6 +1934,11 @@ func (g *Graph) Dependencies(x util.T) map[util.T]struct{} {
 	return g.adj[x]
 }
 
+// Dependents returns the set of rules that depend on x.
+func (g *Graph) Dependents(x util.T) map[util.T]struct{} {
+	return g.radj[x]
+}
+
 // Sort returns a slice of rules sorted by dependencies. If a cycle is found,
 // ok is set to false.
 func (g *Graph) Sort() (sorted []util.T, ok bool) {
@@ -1920,6 +1980,14 @@ func (g *Graph) addDependency(u util.T, v util.T) {
 	}
 
 	edges[v] = struct{}{}
+
+	edges, ok = g.radj[v]
+	if !ok {
+		edges = map[util.T]struct{}{}
+		g.radj[v] = edges
+	}
+
+	edges[u] = struct{}{}
 }
 
 func (g *Graph) addNode(n util.T) {
@@ -2078,7 +2146,7 @@ func reorderBodyForSafety(builtins map[string]*Builtin, arity func(Ref) int, glo
 	safe := VarSet{}
 
 	for _, e := range body {
-		for v := range e.Vars(safetyCheckVarVisitorParams) {
+		for v := range e.Vars(SafetyCheckVisitorParams) {
 			if globals.Contains(v) {
 				safe.Add(v)
 			} else {
@@ -2120,7 +2188,7 @@ func reorderBodyForSafety(builtins map[string]*Builtin, arity func(Ref) int, glo
 	g := globals.Copy()
 	for i, e := range reordered {
 		if i > 0 {
-			g.Update(reordered[i-1].Vars(safetyCheckVarVisitorParams))
+			g.Update(reordered[i-1].Vars(SafetyCheckVisitorParams))
 		}
 		vis := &bodySafetyVisitor{
 			builtins: builtins,
@@ -2182,7 +2250,7 @@ func (vis *bodySafetyVisitor) Visit(x interface{}) bool {
 
 // Check term for safety. This is analogous to the rule head safety check.
 func (vis *bodySafetyVisitor) checkComprehensionSafety(tv VarSet, body Body) Body {
-	bv := body.Vars(safetyCheckVarVisitorParams)
+	bv := body.Vars(SafetyCheckVisitorParams)
 	bv.Update(vis.globals)
 	uv := tv.Diff(bv)
 	for v := range uv {
@@ -2241,7 +2309,7 @@ func reorderBodyForClosures(arity func(Ref) int, globals VarSet, body Body) (Bod
 			// Compute vars that are closed over from the body but not yet
 			// contained in the output position of an expression in the reordered
 			// body. These vars are considered unsafe.
-			cv := vs.Intersect(body.Vars(safetyCheckVarVisitorParams)).Diff(globals)
+			cv := vs.Intersect(body.Vars(SafetyCheckVisitorParams)).Diff(globals)
 			uv := cv.Diff(outputVarsForBody(reordered, arity, globals))
 
 			if len(uv) == 0 {

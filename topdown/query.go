@@ -22,24 +22,27 @@ type QueryResult map[ast.Var]*ast.Term
 
 // Query provides a configurable interface for performing query evaluation.
 type Query struct {
-	seed             io.Reader
-	cancel           Cancel
-	query            ast.Body
-	queryCompiler    ast.QueryCompiler
-	compiler         *ast.Compiler
-	store            storage.Store
-	txn              storage.Transaction
-	input            *ast.Term
-	tracers          []Tracer
-	unknowns         []*ast.Term
-	partialNamespace string
-	metrics          metrics.Metrics
-	instr            *Instrumentation
-	disableInlining  []ast.Ref
-	genvarprefix     string
-	runtime          *ast.Term
-	builtins         map[string]*Builtin
-	indexing         bool
+	seed              io.Reader
+	cancel            Cancel
+	query             ast.Body
+	queryCompiler     ast.QueryCompiler
+	compiler          *ast.Compiler
+	store             storage.Store
+	txn               storage.Transaction
+	input             *ast.Term
+	tracers           []QueryTracer
+	plugTraceVars     bool
+	unknowns          []*ast.Term
+	partialNamespace  string
+	skipSaveNamespace bool
+	metrics           metrics.Metrics
+	instr             *Instrumentation
+	disableInlining   []ast.Ref
+	shallowInlining   bool
+	genvarprefix      string
+	runtime           *ast.Term
+	builtins          map[string]*Builtin
+	indexing          bool
 }
 
 // Builtin represents a built-in function that queries can call.
@@ -97,8 +100,31 @@ func (q *Query) WithInput(input *ast.Term) *Query {
 }
 
 // WithTracer adds a query tracer to use during evaluation. This is optional.
+// Deprecated: Use WithQueryTracer instead.
 func (q *Query) WithTracer(tracer Tracer) *Query {
+	qt, ok := tracer.(QueryTracer)
+	if !ok {
+		qt = wrapLegacyTracer(tracer)
+	}
+	return q.WithQueryTracer(qt)
+}
+
+// WithQueryTracer adds a query tracer to use during evaluation. This is optional.
+// Disabled QueryTracers will be ignored.
+func (q *Query) WithQueryTracer(tracer QueryTracer) *Query {
+	if !tracer.Enabled() {
+		return q
+	}
+
 	q.tracers = append(q.tracers, tracer)
+
+	// If *any* of the tracers require local variable metadata we need to
+	// enabled plugging local trace variables.
+	conf := tracer.Config()
+	if conf.PlugLocalVars {
+		q.plugTraceVars = true
+	}
+
 	return q
 }
 
@@ -131,12 +157,27 @@ func (q *Query) WithPartialNamespace(ns string) *Query {
 	return q
 }
 
+// WithSkipPartialNamespace disables namespacing of saved support rules that are generated
+// from the original policy (rules which are completely syntethic are still namespaced.)
+func (q *Query) WithSkipPartialNamespace(yes bool) *Query {
+	q.skipSaveNamespace = yes
+	return q
+}
+
 // WithDisableInlining adds a set of paths to the query that should be excluded from
 // inlining. Inlining during partial evaluation can be expensive in some cases
 // (e.g., when a cross-product is computed.) Disabling inlining avoids expensive
 // computation at the cost of generating support rules.
 func (q *Query) WithDisableInlining(paths []ast.Ref) *Query {
 	q.disableInlining = paths
+	return q
+}
+
+// WithShallowInlining disables aggressive inlining performed during partial evaluation.
+// When shallow inlining is enabled rules that depend (transitively) on unknowns are not inlined.
+// Only rules/values that are completely known will be inlined.
+func (q *Query) WithShallowInlining(yes bool) *Query {
+	q.shallowInlining = yes
 	return q
 }
 
@@ -200,6 +241,8 @@ func (q *Query) PartialRun(ctx context.Context) (partials []ast.Body, support []
 		txn:                q.txn,
 		input:              q.input,
 		tracers:            q.tracers,
+		traceEnabled:       len(q.tracers) > 0,
+		plugTraceVars:      q.plugTraceVars,
 		instr:              q.instr,
 		builtins:           q.builtins,
 		builtinCache:       builtins.Cache{},
@@ -209,13 +252,17 @@ func (q *Query) PartialRun(ctx context.Context) (partials []ast.Body, support []
 		saveStack:          newSaveStack(),
 		saveSupport:        newSaveSupport(),
 		saveNamespace:      ast.StringTerm(q.partialNamespace),
-		genvarprefix:       q.genvarprefix,
-		runtime:            q.runtime,
-		indexing:           q.indexing,
+		skipSaveNamespace:  q.skipSaveNamespace,
+		inliningControl: &inliningControl{
+			shallow: q.shallowInlining,
+		},
+		genvarprefix: q.genvarprefix,
+		runtime:      q.runtime,
+		indexing:     q.indexing,
 	}
 
 	if len(q.disableInlining) > 0 {
-		e.disableInlining = [][]ast.Ref{q.disableInlining}
+		e.inliningControl.PushDisable(q.disableInlining, false)
 	}
 
 	e.caller = e
@@ -259,7 +306,11 @@ func (q *Query) PartialRun(ctx context.Context) (partials []ast.Body, support []
 			body.Append(bindingExprs[i])
 		}
 
-		partials = append(partials, applyCopyPropagation(p, e.instr, body))
+		if !q.shallowInlining {
+			body = applyCopyPropagation(p, e.instr, body)
+		}
+
+		partials = append(partials, body)
 		return nil
 	})
 
@@ -301,6 +352,8 @@ func (q *Query) Iter(ctx context.Context, iter func(QueryResult) error) error {
 		txn:                q.txn,
 		input:              q.input,
 		tracers:            q.tracers,
+		traceEnabled:       len(q.tracers) > 0,
+		plugTraceVars:      q.plugTraceVars,
 		instr:              q.instr,
 		builtins:           q.builtins,
 		builtinCache:       builtins.Cache{},

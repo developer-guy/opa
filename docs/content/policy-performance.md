@@ -1,7 +1,7 @@
 ---
 title: Policy Performance
 kind: documentation
-weight: 3
+weight: 5
 ---
 
 ## High Performance Policy Decisions
@@ -228,7 +228,7 @@ In order to be indexed, comprehensions must meet the following conditions:
 1. The expression containing the comprehension does not include a `with` statement.
 1. The expression containing the comprehension is not negated.
 1. The comprehension body is safe when considered independent from the outer query.
-1. The comprehension body closes over at least one variable in the outer query and none of these variables appear as outputs in references or `walk()` calls.
+1. The comprehension body closes over at least one variable in the outer query and none of these variables appear as outputs in references or `walk()` calls or inside nested comprehensions.
 
 The following examples show cases that are NOT indexed:
 
@@ -261,6 +261,14 @@ not_indexed_because_no_closure {
 not_indexed_because_reference_operand_closure {
   x := input[y].x
   ys := [y | x == input[y].z[_]]
+}
+
+not_indexed_because_nested_closure {
+  x = 1
+  y = 2
+  _ = [i |
+    x == input.foo[i]
+    _ = [j | y == input.bar[j]]]
 }
 ```
 
@@ -678,6 +686,40 @@ Memory usage also scales linearly with the number of rules loaded into OPA. For 
 loading 10,000 rules that implement an ACL-style authorization policy consumes approximately
 130MB of RAM while 100,000 rules implementing the same policy (but with 10x more tuples to check)
 consumes approximately 1.1GB of RAM.
+
+## Optimization Levels
+
+The `--optimize` (or `-O`) flag on the `opa build` command controls how bundles are optimized.
+
+> Optimization applies partial evaluation to precompute _known_ values in the policy. The goal of
+partial evaluation is to convert non-linear-time policies into linear-time policies.
+
+By specifying the `--optimize` flag, users can control how much time and resources are spent
+attempting to optimize the bundle. Generally, higher optimization levels require more time
+and resources. Currently, OPA supports three optimization levels. The exact optimizations applied
+in each level may change over time.
+
+### -O=0 (default)
+
+By default optimizations are disabled.
+
+### -O=1 (recommended)
+
+Policies are partially evaluated. Rules that DO NOT depend on unknowns (directly or indirectly) are
+evaluated and the virtual documents they produce are inlined into call sites. Virtual documents that
+are required at evaluation time are not inlined. For example, if a base or virtual document is
+targetted by a `with` statement in the policy, the document will not be inlined.
+
+Rules that depend on unknowns (directly or indirectly) are also partially evaluated however the
+virtual documents they produce ARE NOT inlined into call sites. The output policy should be structurally
+similar to the input policy.
+
+### -O=2 (aggressive)
+
+Same as `-O=1` except virtual documents produced by rules that depend on unknowns may be inlined
+into call sites. In addition, more aggressive inlining is applied within rules. This includes
+[copy propagation](https://en.wikipedia.org/wiki/Copy_propagation) and inlining of certain negated
+statements that would otherwise generate support rules.
 
 ## Key Takeaways
 

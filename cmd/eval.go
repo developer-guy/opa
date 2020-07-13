@@ -34,6 +34,7 @@ type evalCommandParams struct {
 	partial           bool
 	unknowns          []string
 	disableInlining   []string
+	shallowInlining   bool
 	disableIndexing   bool
 	dataPaths         repeatedStringFlag
 	inputPath         string
@@ -217,8 +218,9 @@ Set the output format with the --format flag.
 	// Eval specific flags
 	evalCommand.Flags().BoolVarP(&params.coverage, "coverage", "", false, "report coverage")
 	evalCommand.Flags().BoolVarP(&params.partial, "partial", "p", false, "perform partial evaluation")
-	evalCommand.Flags().StringSliceVarP(&params.unknowns, "unknowns", "u", []string{"input"}, "set paths to treat as unknown during partial evaluation")
-	evalCommand.Flags().StringSliceVarP(&params.disableInlining, "disable-inlining", "", []string{}, "set paths of documents to exclude from inlining")
+	evalCommand.Flags().StringArrayVarP(&params.unknowns, "unknowns", "u", []string{"input"}, "set paths to treat as unknown during partial evaluation")
+	evalCommand.Flags().StringArrayVarP(&params.disableInlining, "disable-inlining", "", []string{}, "set paths of documents to exclude from inlining")
+	evalCommand.Flags().BoolVarP(&params.shallowInlining, "shallow-inlining", "", false, "disable inlining of rules that depend on unknowns")
 	evalCommand.Flags().BoolVar(&params.disableIndexing, "disable-indexing", false, "disable indexing optimizations")
 	evalCommand.Flags().BoolVarP(&params.instrument, "instrument", "", false, "enable query instrumentation metrics (implies --metrics)")
 	evalCommand.Flags().BoolVarP(&params.profile, "profile", "", false, "perform expression profiling")
@@ -436,7 +438,7 @@ func setupEval(args []string, params evalCommandParams) (*evalContext, error) {
 		regoArgs = append(regoArgs, rego.Unknowns(params.unknowns))
 	}
 
-	regoArgs = append(regoArgs, rego.DisableInlining(params.disableInlining))
+	regoArgs = append(regoArgs, rego.DisableInlining(params.disableInlining), rego.ShallowInlining(params.shallowInlining))
 
 	var c *cover.Cover
 

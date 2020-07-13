@@ -49,7 +49,9 @@ type eval struct {
 	input              *ast.Term
 	data               *ast.Term
 	targetStack        *refStack
-	tracers            []Tracer
+	tracers            []QueryTracer
+	traceEnabled       bool
+	plugTraceVars      bool
 	instr              *Instrumentation
 	builtins           map[string]*Builtin
 	builtinCache       builtins.Cache
@@ -59,7 +61,8 @@ type eval struct {
 	saveStack          *saveStack
 	saveSupport        *saveSupport
 	saveNamespace      *ast.Term
-	disableInlining    [][]ast.Ref
+	skipSaveNamespace  bool
+	inliningControl    *inliningControl
 	genvarprefix       string
 	genvarid           int
 	runtime            *ast.Term
@@ -133,7 +136,7 @@ func (e *eval) unknown(x interface{}, b *bindings) bool {
 		x = ast.NewTerm(v)
 	}
 
-	return saveRequired(e.compiler, e.saveSet, b, x, false)
+	return saveRequired(e.compiler, e.inliningControl, true, e.saveSet, b, x, false)
 }
 
 func (e *eval) traceEnter(x ast.Node) {
@@ -166,60 +169,63 @@ func (e *eval) traceIndex(x ast.Node, msg string) {
 
 func (e *eval) traceEvent(op Op, x ast.Node, msg string) {
 
-	if !traceIsEnabled(e.tracers) {
+	if !e.traceEnabled {
 		return
 	}
-
-	locals := ast.NewValueMap()
-	localMeta := map[ast.Var]VarMetadata{}
-
-	e.bindings.Iter(nil, func(k, v *ast.Term) error {
-		original := k.Value.(ast.Var)
-		rewritten, _ := e.rewrittenVar(original)
-		localMeta[original] = VarMetadata{
-			Name:     rewritten,
-			Location: k.Loc(),
-		}
-
-		// For backwards compatibility save a copy of the values too..
-		locals.Put(k.Value, v.Value)
-		return nil
-	})
-
-	ast.WalkTerms(x, func(term *ast.Term) bool {
-		if v, ok := term.Value.(ast.Var); ok {
-			if _, ok := localMeta[v]; !ok {
-				if rewritten, ok := e.rewrittenVar(v); ok {
-					localMeta[v] = VarMetadata{
-						Name:     rewritten,
-						Location: term.Loc(),
-					}
-				}
-			}
-		}
-		return false
-	})
 
 	var parentID uint64
 	if e.parent != nil {
 		parentID = e.parent.queryID
 	}
 
-	evt := &Event{
-		QueryID:       e.queryID,
-		ParentID:      parentID,
-		Op:            op,
-		Node:          x,
-		Location:      x.Loc(),
-		Locals:        locals,
-		LocalMetadata: localMeta,
-		Message:       msg,
+	evt := Event{
+		QueryID:  e.queryID,
+		ParentID: parentID,
+		Op:       op,
+		Node:     x,
+		Location: x.Loc(),
+		Message:  msg,
+	}
+
+	// Skip plugging the local variables, unless any of the tracers
+	// had required it via their configuration. If any required the
+	// variable bindings then we will plug and give values for all
+	// tracers.
+	if e.plugTraceVars {
+
+		evt.Locals = ast.NewValueMap()
+		evt.LocalMetadata = map[ast.Var]VarMetadata{}
+
+		e.bindings.Iter(nil, func(k, v *ast.Term) error {
+			original := k.Value.(ast.Var)
+			rewritten, _ := e.rewrittenVar(original)
+			evt.LocalMetadata[original] = VarMetadata{
+				Name:     rewritten,
+				Location: k.Loc(),
+			}
+
+			// For backwards compatibility save a copy of the values too..
+			evt.Locals.Put(k.Value, v.Value)
+			return nil
+		})
+
+		ast.WalkTerms(x, func(term *ast.Term) bool {
+			if v, ok := term.Value.(ast.Var); ok {
+				if _, ok := evt.LocalMetadata[v]; !ok {
+					if rewritten, ok := e.rewrittenVar(v); ok {
+						evt.LocalMetadata[v] = VarMetadata{
+							Name:     rewritten,
+							Location: term.Loc(),
+						}
+					}
+				}
+			}
+			return false
+		})
 	}
 
 	for i := range e.tracers {
-		if e.tracers[i].Enabled() {
-			e.tracers[i].Trace(evt)
-		}
+		e.tracers[i].TraceEvent(evt)
 	}
 }
 
@@ -436,13 +442,13 @@ func (e *eval) evalWithPush(input *ast.Term, data *ast.Term, targets []ast.Ref, 
 	e.comprehensionCache.Push()
 	e.virtualCache.Push()
 	e.targetStack.Push(targets)
-	e.disableInlining = append(e.disableInlining, disable)
+	e.inliningControl.PushDisable(disable, true)
 
 	return oldInput, oldData
 }
 
 func (e *eval) evalWithPop(input *ast.Term, data *ast.Term) {
-	e.disableInlining = e.disableInlining[:len(e.disableInlining)-1]
+	e.inliningControl.PopDisable()
 	e.targetStack.Pop()
 	e.virtualCache.Pop()
 	e.comprehensionCache.Pop()
@@ -465,18 +471,26 @@ func (e *eval) evalNotPartial(iter evalIterator) error {
 	// dependencies of the negation.
 	unknowns := e.saveSet.Vars(e.caller.bindings)
 
-	// Run partial evaluation, plugging the result and applying copy propagation to
-	// each result. Since the result may require support, push a new query onto the
-	// save stack to avoid mutating the current save query.
-	p := copypropagation.New(unknowns).WithEnsureNonEmptyBody(true).WithCompiler(e.compiler)
+	// Run partial evaluation. Since the result may require support, push a new
+	// query onto the save stack to avoid mutating the current save query. If
+	// shallow inlining is not enabled, run copy propagation to further simplify
+	// the result.
+	var cp *copypropagation.CopyPropagator
+
+	if !e.inliningControl.shallow {
+		cp = copypropagation.New(unknowns).WithEnsureNonEmptyBody(true).WithCompiler(e.compiler)
+	}
+
 	var savedQueries []ast.Body
 	e.saveStack.PushQuery(nil)
 
 	child.eval(func(*eval) error {
 		query := e.saveStack.Peek()
 		plugged := query.Plug(e.caller.bindings)
-		result := applyCopyPropagation(p, e.instr, plugged)
-		savedQueries = append(savedQueries, result)
+		if cp != nil {
+			plugged = applyCopyPropagation(cp, e.instr, plugged)
+		}
+		savedQueries = append(savedQueries, plugged)
 		return nil
 	})
 
@@ -494,7 +508,7 @@ func (e *eval) evalNotPartial(iter evalIterator) error {
 	// the unknowns as safe because vars in the save set will either be known to
 	// the caller or made safe by an expression on the save stack.
 	if !canInlineNegation(unknowns, savedQueries) {
-		return e.evalNotPartialSupport(expr, unknowns, savedQueries, iter)
+		return e.evalNotPartialSupport(child.queryID, expr, unknowns, savedQueries, iter)
 	}
 
 	// If we can inline the result, we have to generate the cross product of the
@@ -512,10 +526,10 @@ func (e *eval) evalNotPartial(iter evalIterator) error {
 	})
 }
 
-func (e *eval) evalNotPartialSupport(expr *ast.Expr, unknowns ast.VarSet, queries []ast.Body, iter evalIterator) error {
+func (e *eval) evalNotPartialSupport(negationID uint64, expr *ast.Expr, unknowns ast.VarSet, queries []ast.Body, iter evalIterator) error {
 
 	// Prepare support rule head.
-	supportName := fmt.Sprintf("__not%d_%d__", e.queryID, e.index)
+	supportName := fmt.Sprintf("__not%d_%d_%d__", e.queryID, e.index, negationID)
 	term := ast.RefTerm(ast.DefaultRootDocument, e.saveNamespace, ast.StringTerm(supportName))
 	path := term.Value.(ast.Ref)
 	head := ast.NewHead(ast.Var(supportName), nil, ast.BooleanTerm(true))
@@ -597,15 +611,16 @@ func (e *eval) evalCall(terms []*ast.Term, iter unifyIterator) error {
 	}
 
 	bctx := BuiltinContext{
-		Context:  e.ctx,
-		Seed:     e.seed,
-		Cancel:   e.cancel,
-		Runtime:  e.runtime,
-		Cache:    e.builtinCache,
-		Location: e.query[e.index].Location,
-		Tracers:  e.tracers,
-		QueryID:  e.queryID,
-		ParentID: parentID,
+		Context:      e.ctx,
+		Seed:         e.seed,
+		Cancel:       e.cancel,
+		Runtime:      e.runtime,
+		Cache:        e.builtinCache,
+		Location:     e.query[e.index].Location,
+		QueryTracers: e.tracers,
+		TraceEnabled: e.traceEnabled,
+		QueryID:      e.queryID,
+		ParentID:     parentID,
 	}
 
 	eval := evalBuiltin{
@@ -802,7 +817,6 @@ func (e *eval) biunifyRef(a, b *ast.Term, b1, b2 *bindings, iter unifyIterator) 
 
 	if ref[0].Equal(ast.DefaultRootDocument) {
 		node := e.compiler.RuleTree.Child(ref[0].Value)
-
 		eval := evalTree{
 			e:         e,
 			ref:       ref,
@@ -859,6 +873,8 @@ func (e *eval) biunifyComprehension(a, b *ast.Term, b1, b2 *bindings, swap bool,
 		return err
 	} else if value != nil {
 		return e.biunify(value, b, b1, b2, iter)
+	} else {
+		e.instr.counterIncr(evalOpComprehensionCacheMiss)
 	}
 
 	switch a := a.Value.(type) {
@@ -932,7 +948,7 @@ func (e *eval) buildComprehensionCacheArray(x *ast.ArrayComprehension, keys []*a
 }
 
 func (e *eval) buildComprehensionCacheSet(x *ast.SetComprehension, keys []*ast.Term) (*comprehensionCacheElem, error) {
-	child := e.closure(x.Body)
+	child := e.child(x.Body)
 	node := newComprehensionCacheElem()
 	return node, child.Run(func(child *eval) error {
 		values := make([]*ast.Term, len(keys))
@@ -952,7 +968,7 @@ func (e *eval) buildComprehensionCacheSet(x *ast.SetComprehension, keys []*ast.T
 }
 
 func (e *eval) buildComprehensionCacheObject(x *ast.ObjectComprehension, keys []*ast.Term) (*comprehensionCacheElem, error) {
-	child := e.closure(x.Body)
+	child := e.child(x.Body)
 	node := newComprehensionCacheElem()
 	return node, child.Run(func(child *eval) error {
 		values := make([]*ast.Term, len(keys))
@@ -1159,10 +1175,16 @@ func (e *eval) saveCall(declArgsLen int, terms []*ast.Term, iter unifyIterator) 
 
 func (e *eval) saveInlinedNegatedExprs(exprs []*ast.Expr, iter unifyIterator) error {
 
-	// This function does not include with statements on the exprs because
-	// they will have already been saved and therefore had their any relevant
-	// with statements set.
+	with := make([]*ast.With, len(e.query[e.index].With))
+
+	for i := range e.query[e.index].With {
+		cpy := e.query[e.index].With[i].Copy()
+		cpy.Value = e.bindings.PlugNamespaced(cpy.Value, e.caller.bindings)
+		with[i] = cpy
+	}
+
 	for _, expr := range exprs {
+		expr.With = with
 		e.saveStack.Push(expr, nil, nil)
 		e.traceSave(expr)
 	}
@@ -1212,7 +1234,7 @@ func (e *eval) getRules(ref ast.Ref) (*ast.IndexResult, error) {
 func (e *eval) Resolve(ref ast.Ref) (ast.Value, error) {
 	e.instr.startTimer(evalOpResolve)
 
-	if e.saveSet.Contains(ast.NewTerm(ref), nil) {
+	if e.inliningControl.Disabled(ref, true) || e.saveSet.Contains(ast.NewTerm(ref), nil) {
 		e.instr.stopTimer(evalOpResolve)
 		return nil, ast.UnknownValueErr{}
 	}
@@ -1524,8 +1546,12 @@ func (e evalTree) finish(iter unifyIterator) error {
 
 	// During partial evaluation it may not be possible to compute the value
 	// for this reference if it refers to a virtual document so save the entire
-	// expression. See "save: full extent" test case for an example.
-	if e.node != nil && e.e.unknown(e.ref, e.e.bindings) {
+	// expression. See "save: full extent" test case for an example. We also
+	// need to account for the inlining controls here to prevent base documents
+	// from being inlined when they should not be.
+	save := e.e.unknown(e.ref, e.e.bindings)
+
+	if save {
 		return e.e.saveUnify(ast.NewTerm(e.plugged), e.rterm, e.bindings, e.rbindings, iter)
 	}
 
@@ -1571,6 +1597,11 @@ func (e evalTree) next(iter unifyIterator, plugged *ast.Term) error {
 }
 
 func (e evalTree) enumerate(iter unifyIterator) error {
+
+	if e.e.inliningControl.Disabled(e.plugged[:e.pos], true) {
+		return e.e.saveUnify(ast.NewTerm(e.plugged), e.rterm, e.bindings, e.rbindings, iter)
+	}
+
 	doc, err := e.e.Resolve(e.plugged[:e.pos])
 	if err != nil {
 		return err
@@ -1613,7 +1644,7 @@ func (e evalTree) enumerate(iter unifyIterator) error {
 		return nil
 	}
 
-	for k := range e.node.Children {
+	for _, k := range e.node.Sorted {
 		key := ast.NewTerm(k)
 		if err := e.e.biunify(key, e.ref[e.pos], e.bindings, e.bindings, func() error {
 			return e.next(iter, key)
@@ -1662,7 +1693,10 @@ func (e evalTree) leaves(plugged ast.Ref, node *ast.TreeNode) (ast.Object, error
 
 	result := ast.NewObject()
 
-	for _, child := range node.Children {
+	for _, k := range node.Sorted {
+
+		child := node.Children[k]
+
 		if child.Hide {
 			continue
 		}
@@ -1776,44 +1810,42 @@ type evalVirtualPartial struct {
 
 func (e evalVirtualPartial) eval(iter unifyIterator) error {
 
+	unknown := e.e.unknown(e.ref[:e.pos+1], e.bindings)
+
 	if len(e.ref) == e.pos+1 {
-		// During partial evaluation, it may not be possible to produce a value
-		// for this reference so save the entire expression. See "save: full
-		// extent: partial object" test case for an example.
-		if e.e.unknown(e.ref, e.bindings) {
-			return e.e.saveUnify(ast.NewTerm(e.ref), e.rterm, e.bindings, e.rbindings, iter)
+		if unknown {
+			return e.partialEvalSupport(iter)
 		}
 		return e.evalAllRules(iter, e.ir.Rules)
 	}
 
-	var cacheKey ast.Ref
-
-	if e.ir.Kind == ast.PartialObjectDoc {
-		plugged := e.bindings.Plug(e.ref[e.pos+1])
-
-		if plugged.IsGround() {
-			path := e.plugged[:e.pos+2]
-			path[len(path)-1] = plugged
-			cached := e.e.virtualCache.Get(path)
-
-			if cached != nil {
-				e.e.instr.counterIncr(evalOpVirtualCacheHit)
-				return e.evalTerm(iter, cached, e.bindings)
-			}
-
-			e.e.instr.counterIncr(evalOpVirtualCacheMiss)
-			cacheKey = path
-		}
-	}
-
-	generateSupport := anyRefSetContainsPrefix(e.e.disableInlining, e.plugged[:e.pos+1])
-
-	if generateSupport {
+	if (unknown && e.e.inliningControl.shallow) || e.e.inliningControl.Disabled(e.ref[:e.pos+1], false) {
 		return e.partialEvalSupport(iter)
 	}
 
+	return e.evalEachRule(iter, e.ir.Rules)
+}
+
+func (e evalVirtualPartial) evalEachRule(iter unifyIterator, rules []*ast.Rule) error {
+
+	if e.e.unknown(e.ref[e.pos+1], e.bindings) {
+		for _, rule := range e.ir.Rules {
+			if err := e.evalOneRulePostUnify(iter, rule); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	key, hit, err := e.evalCache(iter)
+	if err != nil {
+		return err
+	} else if hit {
+		return nil
+	}
+
 	for _, rule := range e.ir.Rules {
-		if err := e.evalOneRule(iter, rule, cacheKey); err != nil {
+		if err := e.evalOneRulePreUnify(iter, rule, key); err != nil {
 			return err
 		}
 	}
@@ -1849,7 +1881,7 @@ func (e evalVirtualPartial) evalAllRules(iter unifyIterator, rules []*ast.Rule) 
 	return e.e.biunify(result, e.rterm, e.bindings, e.bindings, iter)
 }
 
-func (e evalVirtualPartial) evalOneRule(iter unifyIterator, rule *ast.Rule, cacheKey ast.Ref) error {
+func (e evalVirtualPartial) evalOneRulePreUnify(iter unifyIterator, rule *ast.Rule, cacheKey ast.Ref) error {
 
 	key := e.ref[e.pos+1]
 	child := e.e.child(rule.Body)
@@ -1887,6 +1919,7 @@ func (e evalVirtualPartial) evalOneRule(iter unifyIterator, rule *ast.Rule, cach
 		return err
 	}
 
+	// TODO(tsandall): why are we tracing here? this looks wrong.
 	if !defined {
 		child.traceFail(rule)
 	}
@@ -1894,32 +1927,88 @@ func (e evalVirtualPartial) evalOneRule(iter unifyIterator, rule *ast.Rule, cach
 	return nil
 }
 
+func (e evalVirtualPartial) evalOneRulePostUnify(iter unifyIterator, rule *ast.Rule) error {
+
+	key := e.ref[e.pos+1]
+	child := e.e.child(rule.Body)
+
+	child.traceEnter(rule)
+	var defined bool
+
+	err := child.eval(func(child *eval) error {
+		defined = true
+		return e.e.biunify(rule.Head.Key, key, child.bindings, e.bindings, func() error {
+			return e.evalOneRuleContinue(iter, rule, child)
+		})
+	})
+
+	if err != nil {
+		return err
+	}
+
+	if !defined {
+		child.traceFail(rule)
+	}
+
+	return nil
+}
+
+func (e evalVirtualPartial) evalOneRuleContinue(iter unifyIterator, rule *ast.Rule, child *eval) error {
+
+	child.traceExit(rule)
+
+	term := rule.Head.Value
+	if term == nil {
+		term = rule.Head.Key
+	}
+
+	term, termbindings := child.bindings.apply(term)
+	err := e.evalTerm(iter, term, termbindings)
+	if err != nil {
+		return err
+	}
+
+	child.traceRedo(rule)
+	return nil
+}
+
 func (e evalVirtualPartial) partialEvalSupport(iter unifyIterator) error {
 
-	path := e.plugged[:e.pos+1].Insert(e.e.saveNamespace, 1)
+	path, term := e.e.savePackagePathAndTerm(e.plugged[:e.pos+1], e.ref)
 
-	if !e.e.saveSupport.Exists(path) {
+	var defined bool
+
+	if e.e.saveSupport.Exists(path) {
+		defined = true
+	} else {
 		for i := range e.ir.Rules {
-			err := e.partialEvalSupportRule(iter, e.ir.Rules[i], path)
+			ok, err := e.partialEvalSupportRule(iter, e.ir.Rules[i], path)
 			if err != nil {
 				return err
+			} else if ok {
+				defined = true
 			}
 		}
 	}
 
-	rewritten := ast.NewTerm(e.ref.Insert(e.e.saveNamespace, 1))
-	return e.e.saveUnify(rewritten, e.rterm, e.bindings, e.rbindings, iter)
+	if !defined {
+		term = e.empty
+	}
+
+	return e.e.saveUnify(term, e.rterm, e.bindings, e.rbindings, iter)
 }
 
-func (e evalVirtualPartial) partialEvalSupportRule(iter unifyIterator, rule *ast.Rule, path ast.Ref) error {
+func (e evalVirtualPartial) partialEvalSupportRule(iter unifyIterator, rule *ast.Rule, path ast.Ref) (bool, error) {
 
 	child := e.e.child(rule.Body)
 	child.traceEnter(rule)
 
 	e.e.saveStack.PushQuery(nil)
+	var defined bool
 
 	err := child.eval(func(child *eval) error {
 		child.traceExit(rule)
+		defined = true
 
 		current := e.e.saveStack.PopQuery()
 		plugged := current.Plug(e.e.caller.bindings)
@@ -1935,11 +2024,17 @@ func (e evalVirtualPartial) partialEvalSupportRule(iter unifyIterator, rule *ast
 		}
 
 		head := ast.NewHead(rule.Head.Name, key, value)
-		p := copypropagation.New(head.Vars()).WithEnsureNonEmptyBody(true).WithCompiler(e.e.compiler)
+
+		if !e.e.inliningControl.shallow {
+			cp := copypropagation.New(head.Vars()).
+				WithEnsureNonEmptyBody(true).
+				WithCompiler(e.e.compiler)
+			plugged = applyCopyPropagation(cp, e.e.instr, plugged)
+		}
 
 		e.e.saveSupport.Insert(path, &ast.Rule{
 			Head:    head,
-			Body:    p.Apply(plugged),
+			Body:    plugged,
 			Default: rule.Default,
 		})
 
@@ -1948,7 +2043,7 @@ func (e evalVirtualPartial) partialEvalSupportRule(iter unifyIterator, rule *ast
 		return nil
 	})
 	e.e.saveStack.PopQuery()
-	return err
+	return defined, err
 }
 
 func (e evalVirtualPartial) evalTerm(iter unifyIterator, term *ast.Term, termbindings *bindings) error {
@@ -1963,6 +2058,36 @@ func (e evalVirtualPartial) evalTerm(iter unifyIterator, term *ast.Term, termbin
 		rbindings:    e.rbindings,
 	}
 	return eval.eval(iter)
+}
+
+func (e evalVirtualPartial) evalCache(iter unifyIterator) (ast.Ref, bool, error) {
+
+	if e.e.unknown(e.ref[:e.pos+1], e.bindings) {
+		return nil, false, nil
+	}
+
+	var cacheKey ast.Ref
+
+	if e.ir.Kind == ast.PartialObjectDoc {
+
+		plugged := e.bindings.Plug(e.ref[e.pos+1])
+
+		if plugged.IsGround() {
+			path := e.plugged[:e.pos+2]
+			path[len(path)-1] = plugged
+			cached := e.e.virtualCache.Get(path)
+
+			if cached != nil {
+				e.e.instr.counterIncr(evalOpVirtualCacheHit)
+				return nil, true, e.evalTerm(iter, cached, e.bindings)
+			}
+
+			e.e.instr.counterIncr(evalOpVirtualCacheMiss)
+			cacheKey = path
+		}
+	}
+
+	return cacheKey, false, nil
 }
 
 func (e evalVirtualPartial) reduce(head *ast.Head, b *bindings, result *ast.Term) (*ast.Term, error) {
@@ -2021,9 +2146,7 @@ func (e evalVirtualComplete) eval(iter unifyIterator) error {
 		generateSupport = !ast.IsConstant(rterm.Value) || e.ir.Default.Head.Value.Equal(rterm)
 	}
 
-	generateSupport = generateSupport || anyRefSetContainsPrefix(e.e.disableInlining, e.plugged[:e.pos+1])
-
-	if generateSupport {
+	if generateSupport || e.e.inliningControl.shallow || e.e.inliningControl.Disabled(e.plugged[:e.pos+1], false) {
 		return e.partialEvalSupport(iter)
 	}
 
@@ -2133,7 +2256,7 @@ func (e evalVirtualComplete) partialEval(iter unifyIterator) error {
 
 func (e evalVirtualComplete) partialEvalSupport(iter unifyIterator) error {
 
-	path := e.plugged[:e.pos+1].Insert(e.e.saveNamespace, 1)
+	path, term := e.e.savePackagePathAndTerm(e.plugged[:e.pos+1], e.ref)
 
 	if !e.e.saveSupport.Exists(path) {
 
@@ -2152,8 +2275,7 @@ func (e evalVirtualComplete) partialEvalSupport(iter unifyIterator) error {
 		}
 	}
 
-	rewritten := ast.NewTerm(e.ref.Insert(e.e.saveNamespace, 1))
-	return e.e.saveUnify(rewritten, e.rterm, e.bindings, e.rbindings, iter)
+	return e.e.saveUnify(term, e.rterm, e.bindings, e.rbindings, iter)
 }
 
 func (e evalVirtualComplete) partialEvalSupportRule(iter unifyIterator, rule *ast.Rule, path ast.Ref) error {
@@ -2170,11 +2292,17 @@ func (e evalVirtualComplete) partialEvalSupportRule(iter unifyIterator, rule *as
 		plugged := current.Plug(e.e.caller.bindings)
 
 		head := ast.NewHead(rule.Head.Name, nil, child.bindings.PlugNamespaced(rule.Head.Value, e.e.caller.bindings))
-		p := copypropagation.New(head.Vars()).WithEnsureNonEmptyBody(true).WithCompiler(e.e.compiler)
+
+		if !e.e.inliningControl.shallow {
+			cp := copypropagation.New(head.Vars()).
+				WithEnsureNonEmptyBody(true).
+				WithCompiler(e.e.compiler)
+			plugged = applyCopyPropagation(cp, e.e.instr, plugged)
+		}
 
 		e.e.saveSupport.Insert(path, &ast.Rule{
 			Head:    head,
-			Body:    applyCopyPropagation(p, e.e.instr, plugged),
+			Body:    plugged,
 			Default: rule.Default,
 		})
 
@@ -2350,6 +2478,15 @@ func (e *eval) comprehensionIndex(term *ast.Term) *ast.ComprehensionIndex {
 	return e.compiler.ComprehensionIndex(term)
 }
 
+func (e *eval) savePackagePathAndTerm(plugged, ref ast.Ref) (ast.Ref, *ast.Term) {
+
+	if e.skipSaveNamespace {
+		return plugged, ast.NewTerm(ref)
+	}
+
+	return plugged.Insert(e.saveNamespace, 1), ast.NewTerm(ref.Insert(e.saveNamespace, 1))
+}
+
 func applyCopyPropagation(p *copypropagation.CopyPropagator, instr *Instrumentation, body ast.Body) ast.Body {
 	instr.startTimer(partialOpCopyPropagation)
 	result := p.Apply(body)
@@ -2381,10 +2518,21 @@ func plugSlice(xs []*ast.Term, b *bindings) []*ast.Term {
 func canInlineNegation(safe ast.VarSet, queries []ast.Body) bool {
 
 	size := 1
+	vis := newNestedCheckVisitor()
 
 	for _, query := range queries {
 		size *= len(query)
 		for _, expr := range query {
+			if containsNestedRefOrCall(vis, expr) {
+				// Expressions containing nested refs or calls cannot be trivially negated
+				// because the semantics would change. For example, the complement of `not f(input.x)`
+				// is _not_ `f(input.x)`--it is `not input.x` OR `f(input.x)`.
+				//
+				// NOTE(tsandall): Since this would require the complement function to undo the
+				// copy propagation optimization, just bail out here. If this becomes a problem
+				// in the future, we can handle more cases.
+				return false
+			}
 			if !expr.Negated {
 				// Positive expressions containing variables cannot be trivially negated
 				// because they become unsafe (e.g., "x = 1" negated is "not x = 1" making x
@@ -2410,6 +2558,68 @@ func canInlineNegation(safe ast.VarSet, queries []ast.Body) bool {
 	}
 
 	return true
+}
+
+type nestedCheckVisitor struct {
+	vis   *ast.GenericVisitor
+	found bool
+}
+
+func newNestedCheckVisitor() *nestedCheckVisitor {
+	v := &nestedCheckVisitor{}
+	v.vis = ast.NewGenericVisitor(v.visit)
+	return v
+}
+
+func (v *nestedCheckVisitor) visit(x interface{}) bool {
+	switch x.(type) {
+	case ast.Ref, ast.Call:
+		v.found = true
+	}
+	return v.found
+}
+
+func containsNestedRefOrCall(vis *nestedCheckVisitor, expr *ast.Expr) bool {
+
+	if expr.IsEquality() {
+		for _, term := range expr.Operands() {
+			if containsNestedRefOrCallInTerm(vis, term) {
+				return true
+			}
+		}
+		return false
+	}
+
+	if expr.IsCall() {
+		for _, term := range expr.Operands() {
+			vis.vis.Walk(term)
+			if vis.found {
+				return true
+			}
+		}
+		return false
+	}
+
+	return containsNestedRefOrCallInTerm(vis, expr.Terms.(*ast.Term))
+}
+
+func containsNestedRefOrCallInTerm(vis *nestedCheckVisitor, term *ast.Term) bool {
+	switch v := term.Value.(type) {
+	case ast.Ref:
+		for i := 1; i < len(v); i++ {
+			vis.vis.Walk(v[i])
+			if vis.found {
+				return true
+			}
+		}
+		return false
+	default:
+		vis.vis.Walk(v)
+		if vis.found {
+			return true
+		}
+		return false
+	}
 }
 
 func complementedCartesianProduct(queries []ast.Body, idx int, curr ast.Body, iter func(ast.Body) error) error {
@@ -2489,17 +2699,6 @@ func mergeObjects(objA, objB ast.Object) (result ast.Object, ok bool) {
 		}
 	})
 	return result, true
-}
-
-func anyRefSetContainsPrefix(s [][]ast.Ref, prefix ast.Ref) bool {
-	for _, refs := range s {
-		for _, ref := range refs {
-			if ref.HasPrefix(prefix) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func refContainsNonScalar(ref ast.Ref) bool {

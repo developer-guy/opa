@@ -176,9 +176,11 @@ var DefaultBuiltins = [...]*Builtin{
 	CryptoMd5,
 	CryptoSha1,
 	CryptoSha256,
+	CryptoX509ParseCertificateRequest,
 
 	// Graphs
 	WalkBuiltin,
+	ReachableBuiltin,
 
 	// Sort
 	Sort,
@@ -1565,6 +1567,16 @@ var CryptoX509ParseCertificates = &Builtin{
 	),
 }
 
+// CryptoX509ParseCertificateRequest returns a PKCS #10 certificate signing
+// request from the given PEM-encoded PKCS#10 certificate signing request.
+var CryptoX509ParseCertificateRequest = &Builtin{
+	Name: "crypto.x509.parse_certificate_request",
+	Decl: types.NewFunction(
+		types.Args(types.S),
+		types.NewObject(nil, types.NewDynamicProperty(types.S, types.A)),
+	),
+}
+
 // CryptoMd5 returns a string representing the input string hashed with the md5 function
 var CryptoMd5 = &Builtin{
 	Name: "crypto.md5",
@@ -1610,6 +1622,26 @@ var WalkBuiltin = &Builtin{
 			},
 			nil,
 		),
+	),
+}
+
+// ReachableBuiltin computes the set of reachable nodes in the graph from a set
+// of starting nodes.
+var ReachableBuiltin = &Builtin{
+	Name: "graph.reachable",
+	Decl: types.NewFunction(
+		types.Args(
+			types.NewObject(
+				nil,
+				types.NewDynamicProperty(
+					types.A,
+					types.NewAny(
+						types.NewSet(types.A),
+						types.NewArray(nil, types.A)),
+				)),
+			types.NewAny(types.NewSet(types.A), types.NewArray(nil, types.A)),
+		),
+		types.NewSet(types.A),
 	),
 }
 

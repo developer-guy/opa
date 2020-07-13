@@ -1,14 +1,20 @@
 DOCKER := docker
 
-WASM_BUILDER_REPOSITORY := openpolicyagent/opa-wasm-builder
-WASM_BUILDER_VERSION := 1.0
-WASM_BUILDER_IMAGE := $(WASM_BUILDER_REPOSITORY):$(WASM_BUILDER_VERSION)
-WASM_OBJ_DIR := _obj
+ifeq ($(shell tty > /dev/null && echo 1 || echo 0), 1)
+DOCKER_FLAGS := --rm -it
+else
+DOCKER_FLAGS := --rm
+endif
 
-$(shell mkdir -p $(WASM_OBJ_DIR))
+DOCKER_WASM_BUILDER_IMAGE ?= openpolicyagent/opa-wasm-builder
+WASM_BUILDER_VERSION := 1.1
+WASM_BUILDER_IMAGE := $(DOCKER_WASM_BUILDER_IMAGE):$(WASM_BUILDER_VERSION)
+WASM_OBJ_DIR := _obj
 
 CFLAGS := \
 	-O3 \
+	-MD \
+	-MP \
 	-nostdinc \
 	-nodefaultlibs \
 	--target=wasm32-unknown-unknown-wasm \
@@ -25,141 +31,75 @@ clean:
 
 .PHONY: builder
 builder: Dockerfile
-	@$(DOCKER) build -t $(WASM_BUILDER_IMAGE) -f Dockerfile .
+	$(DOCKER) build -t $(WASM_BUILDER_IMAGE) -f Dockerfile .
+
+.PHONY: ensure-builder
+ensure-builder:
+	@$(DOCKER) inspect $(WASM_BUILDER_IMAGE) > /dev/null || $(DOCKER) pull $(WASM_BUILDER_IMAGE) || $(MAKE) builder
+
+.PHONY: push-builder
+push-builder:
+	$(DOCKER) push $(WASM_BUILDER_IMAGE)
 
 .PHONY: build
 build:
-	@$(DOCKER) run -it --rm -v $(CURDIR):/src $(WASM_BUILDER_IMAGE) make $(WASM_OBJ_DIR)/opa.wasm
+	@$(DOCKER) run $(DOCKER_FLAGS) -v $(CURDIR):/src $(WASM_BUILDER_IMAGE) make $(WASM_OBJ_DIR)/opa.wasm
 
 .PHONY: test
 test:
-	@$(DOCKER) run -it --rm -v $(CURDIR):/src $(WASM_BUILDER_IMAGE) make $(WASM_OBJ_DIR)/opa-test.wasm
-	@$(DOCKER) run -it --rm -e VERBOSE=$(VERBOSE) -v $(CURDIR):/src -w /src node:8 node test.js $(WASM_OBJ_DIR)/opa-test.wasm
+	@$(DOCKER) run $(DOCKER_FLAGS) -v $(CURDIR):/src $(WASM_BUILDER_IMAGE) make $(WASM_OBJ_DIR)/opa-test.wasm
+	@$(DOCKER) run $(DOCKER_FLAGS) -e VERBOSE=$(VERBOSE) -v $(CURDIR):/src -w /src node:8 node test.js $(WASM_OBJ_DIR)/opa-test.wasm
 
 .PHONY: hack
 hack:
-	@$(DOCKER) run -it --rm -v $(CURDIR):/src $(WASM_BUILDER_IMAGE)
+	@$(DOCKER) run $(DOCKER_FLAGS) -v $(CURDIR):/src $(WASM_BUILDER_IMAGE)
 
-$(WASM_OBJ_DIR)/arithmetic.wasm: src/arithmetic.c
-	@$(CC) $(CFLAGS) -c $^ -o $@
+$(shell mkdir -p $(WASM_OBJ_DIR)/src/lib)
+$(shell mkdir -p $(WASM_OBJ_DIR)/src/libmpdec)
+$(shell mkdir -p $(WASM_OBJ_DIR)/src)
+$(shell mkdir -p $(WASM_OBJ_DIR)/tests)
 
-$(WASM_OBJ_DIR)/array.wasm: src/array.c
-	@$(CC) $(CFLAGS) -c $^ -o $@
+SRCS := $(sort $(wildcard src/*.c))
+LIB_SRCS := $(sort $(wildcard src/lib/*.c))
+LIB_MPDEC_SRCS := $(sort $(wildcard src/libmpdec/*.c))
+TEST_SRCS := $(sort $(wildcard tests/*.c))
 
-$(WASM_OBJ_DIR)/context.wasm: src/context.c
-	@$(CC) $(CFLAGS) -c $^ -o $@
+-include $(patsubst %.c,$(WASM_OBJ_DIR)/%.d,$(SRCS))
+-include $(patsubst %.c,$(WASM_OBJ_DIR)/%.d,$(LIB_SRCS))
+-include $(patsubst %.c,$(WASM_OBJ_DIR)/%.d,$(LIB_MPDEC_SRCS))
+-include $(patsubst %.c,$(WASM_OBJ_DIR)/%.d,$(TEST_SRCS))
 
-$(WASM_OBJ_DIR)/json.wasm: src/json.c
-	@$(CC) $(CFLAGS) -c $^ -o $@
+OBJS := $(patsubst %.c, $(WASM_OBJ_DIR)/%.wasm, $(SRCS))
+LIB_OBJS := $(patsubst %.c, $(WASM_OBJ_DIR)/%.wasm, $(LIB_SRCS))
+LIB_MPDEC_OBJS := $(patsubst %.c, $(WASM_OBJ_DIR)/%.wasm, $(LIB_MPDEC_SRCS))
+TEST_OBJS := $(patsubst %.c, $(WASM_OBJ_DIR)/%.wasm, $(TEST_SRCS))
 
-$(WASM_OBJ_DIR)/malloc.wasm: src/malloc.c
-	@$(CC) $(CFLAGS) -c $^ -o $@
+$(OBJS): $(WASM_OBJ_DIR)/src/%.wasm: src/%.c
+	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(WASM_OBJ_DIR)/set.wasm: src/set.c
-	@$(CC) $(CFLAGS) -c $^ -o $@
+$(LIB_OBJS): $(WASM_OBJ_DIR)/src/lib/%.wasm: src/lib/%.c
+	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(WASM_OBJ_DIR)/str.wasm: src/str.c
-	@$(CC) $(CFLAGS) -c $^ -o $@
+$(LIB_MPDEC_OBJS): $(WASM_OBJ_DIR)/src/libmpdec/%.wasm: src/libmpdec/%.c
+	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(WASM_OBJ_DIR)/types.wasm: src/types.c
-	@$(CC) $(CFLAGS) -c $^ -o $@
+$(TEST_OBJS): $(WASM_OBJ_DIR)/tests/%.wasm: tests/%.c
+	$(CC) $(CFLAGS) -I src -c -o $@ $<
 
-$(WASM_OBJ_DIR)/unicode.wasm: src/unicode.c
-	@$(CC) $(CFLAGS) -c $^ -o $@
-
-$(WASM_OBJ_DIR)/value.wasm: src/value.c
-	@$(CC) $(CFLAGS) -c $^ -o $@
-
-$(WASM_OBJ_DIR)/lib-%.wasm: src/lib/%.c
-	@$(CC) $(CFLAGS) -c $^ -o $@
-
-$(WASM_OBJ_DIR)/libmpdec-%.wasm: src/libmpdec/%.c
-	@$(CC) $(CFLAGS) -c $^ -o $@
-
-$(WASM_OBJ_DIR)/opa.wasm: \
-		$(WASM_OBJ_DIR)/arithmetic.wasm \
-		$(WASM_OBJ_DIR)/array.wasm \
-		$(WASM_OBJ_DIR)/context.wasm \
-		$(WASM_OBJ_DIR)/json.wasm \
-		$(WASM_OBJ_DIR)/lib-ctype.wasm \
-		$(WASM_OBJ_DIR)/lib-errno.wasm \
-		$(WASM_OBJ_DIR)/lib-locale.wasm \
-		$(WASM_OBJ_DIR)/lib-math.wasm \
-		$(WASM_OBJ_DIR)/lib-printf.wasm \
-		$(WASM_OBJ_DIR)/lib-stdio.wasm \
-		$(WASM_OBJ_DIR)/lib-stdlib.wasm \
-		$(WASM_OBJ_DIR)/lib-string.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-basearith.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-constants.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-context.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-convolute.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-crt.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-difradix2.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-fnt.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-fourstep.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-io.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-memory.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-mpdecimal.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-numbertheory.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-sixstep.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-transpose.wasm \
-		$(WASM_OBJ_DIR)/malloc.wasm \
-		$(WASM_OBJ_DIR)/str.wasm \
-		$(WASM_OBJ_DIR)/set.wasm \
-		$(WASM_OBJ_DIR)/types.wasm \
-		$(WASM_OBJ_DIR)/unicode.wasm \
-		$(WASM_OBJ_DIR)/value.wasm
-	@wasm-ld-8 \
+$(WASM_OBJ_DIR)/opa.wasm: $(OBJS) $(LIB_OBJS) $(LIB_MPDEC_OBJS)
+	wasm-ld-10 \
 			--allow-undefined-file=src/undefined.symbols \
 			--import-memory \
 			--no-entry \
 			--export-all \
-			$^ \
-			-o $@
+			-o $@ $^
 	@wasm2wat $(WASM_OBJ_DIR)/opa.wasm > $(WASM_OBJ_DIR)/opa.wast
 
-$(WASM_OBJ_DIR)/test.wasm: tests/test.c
-	@$(CC) $(CFLAGS) -I src -c $^ -o $@
-
-$(WASM_OBJ_DIR)/opa-test.wasm: \
-		$(WASM_OBJ_DIR)/arithmetic.wasm \
-		$(WASM_OBJ_DIR)/array.wasm \
-		$(WASM_OBJ_DIR)/context.wasm \
-		$(WASM_OBJ_DIR)/json.wasm \
-		$(WASM_OBJ_DIR)/lib-ctype.wasm \
-		$(WASM_OBJ_DIR)/lib-errno.wasm \
-		$(WASM_OBJ_DIR)/lib-locale.wasm \
-		$(WASM_OBJ_DIR)/lib-math.wasm \
-		$(WASM_OBJ_DIR)/lib-printf.wasm \
-		$(WASM_OBJ_DIR)/lib-stdio.wasm \
-		$(WASM_OBJ_DIR)/lib-stdlib.wasm \
-		$(WASM_OBJ_DIR)/lib-string.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-basearith.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-constants.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-context.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-convolute.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-crt.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-difradix2.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-fnt.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-fourstep.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-io.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-memory.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-mpdecimal.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-numbertheory.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-sixstep.wasm \
-		$(WASM_OBJ_DIR)/libmpdec-transpose.wasm \
-		$(WASM_OBJ_DIR)/malloc.wasm \
-		$(WASM_OBJ_DIR)/str.wasm \
-		$(WASM_OBJ_DIR)/set.wasm \
-		$(WASM_OBJ_DIR)/test.wasm \
-		$(WASM_OBJ_DIR)/types.wasm \
-		$(WASM_OBJ_DIR)/unicode.wasm \
-		$(WASM_OBJ_DIR)/value.wasm
+$(WASM_OBJ_DIR)/opa-test.wasm: $(OBJS) $(LIB_OBJS) $(LIB_MPDEC_OBJS) $(TEST_OBJS)
 	@cat src/undefined.symbols tests/undefined.symbols > _obj/undefined.symbols
-	@wasm-ld-8 \
+	@wasm-ld-10 \
 			--allow-undefined-file=_obj/undefined.symbols \
 			--import-memory \
 			--no-entry \
 			--export-all \
-			$^ \
-			-o $@
+			-o $@ $^

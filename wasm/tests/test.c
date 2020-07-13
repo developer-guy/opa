@@ -1,9 +1,15 @@
-#include "str.h"
-#include "json.h"
-#include "malloc.h"
+#include <ctype.h>
+
+#include "aggregates.h"
 #include "arithmetic.h"
 #include "array.h"
+#include "bits-builtins.h"
+#include "json.h"
+#include "malloc.h"
+#include "mpd.h"
 #include "set.h"
+#include "str.h"
+#include "strings.h"
 #include "types.h"
 
 void opa_test_fail(const char *note, const char *func, const char *file, int line);
@@ -42,6 +48,89 @@ void test_opa_malloc()
             buf[x] = x % 255;
         }
     }
+}
+
+void test_opa_free()
+{
+
+    // check the heap shrinks with a single malloc and free.
+
+    size_t blocks = opa_heap_free_blocks();
+    unsigned int base = opa_heap_ptr_get();
+    opa_free(opa_malloc(0));
+
+    test("heap ptr", base == opa_heap_ptr_get());
+    test("free blocks", blocks == 0 && opa_heap_free_blocks() == 0);
+
+    // check the double malloc, followed with frees in identical order
+    // results in eventual heap shrinking.
+
+    void *p1 = opa_malloc(0);
+    void *p2 = opa_malloc(0);
+    unsigned int high = opa_heap_ptr_get();
+    test("free blocks", opa_heap_free_blocks() == 0);
+
+    opa_free(p1);
+    test("free blocks", opa_heap_free_blocks() == 1);
+    test("heap ptr", high == opa_heap_ptr_get());
+
+    opa_free(p2);
+    test("free blocks", opa_heap_free_blocks() == 0);
+    test("heap ptr", base == opa_heap_ptr_get());
+
+    // check the double malloc, followed with frees in reverse order
+    // results in gradual heap shrinking.
+
+    p1 = opa_malloc(0);
+    p2 = opa_malloc(0);
+    high = opa_heap_ptr_get();
+    test("free blocks", opa_heap_free_blocks() == 0);
+
+    opa_free(p2);
+    test("free blocks", opa_heap_free_blocks() == 0);
+    test("heap ptr", high > opa_heap_ptr_get());
+
+    opa_free(p1);
+    test("free blocks", opa_heap_free_blocks() == 0);
+    test("heap ptr", base == opa_heap_ptr_get());
+
+    // check the free re-use (without splitting).
+
+    p1 = opa_malloc(1);
+    p2 = opa_malloc(1);
+    high = opa_heap_ptr_get();
+
+    opa_free(p1);
+    test("free blocks", opa_heap_free_blocks() == 1);
+
+    p1 = opa_malloc(1);
+    test("free blocks", opa_heap_free_blocks() == 0);
+    test("heap ptr", high == opa_heap_ptr_get());
+
+    opa_free(p2);
+    opa_free(p1);
+    test("free blocks", opa_heap_free_blocks() == 0);
+    test("heap ptr", base == opa_heap_ptr_get());
+
+    // check the free re-use (with splitting).
+
+    p1 = opa_malloc(64);
+    p2 = opa_malloc(64);
+    high = opa_heap_ptr_get();
+
+    opa_free(p1);
+    test("free blocks", opa_heap_free_blocks() == 1);
+
+    p1 = opa_malloc(1);
+    test("free blocks", opa_heap_free_blocks() == 1);
+    test("heap ptr", high == opa_heap_ptr_get());
+
+    opa_free(p2);
+    test("free blocks", opa_heap_free_blocks() == 0);
+
+    opa_free(p1);
+    test("free blocks", opa_heap_free_blocks() == 0);
+    test("heap ptr", base == opa_heap_ptr_get());
 }
 
 void test_opa_strlen()
@@ -518,8 +607,15 @@ void test_opa_array_sort()
 
     opa_array_sort(arr, opa_value_compare);
 
-    opa_value *res = &arr->hdr;
+    // iterate through the array to verify both the indices and values.
+
+    opa_value *res = opa_array();
     opa_value *exp = &fixture_array1()->hdr;
+
+    for (opa_value *prev = NULL, *curr = NULL; (curr = opa_value_iter(&arr->hdr, prev)) != NULL; prev = curr)
+    {
+        opa_array_append(opa_cast_array(res), opa_value_get(&arr->hdr, curr));
+    }
 
     if (opa_value_compare(res, exp) != 0)
     {
@@ -1079,4 +1175,500 @@ void test_types(void)
     test("name/array", opa_value_compare(opa_types_name(opa_array()), opa_string("array", 5)) == 0);
     test("name/object", opa_value_compare(opa_types_name(opa_object()), opa_string("object", 6)) == 0);
     test("name/set", opa_value_compare(opa_types_name(opa_set()), opa_string("set", 3)) == 0);
+}
+
+static opa_value *number(const char *s)
+{
+    size_t n = strlen(s);
+    uint8_t sign = MPD_POS;
+    size_t pos = 2;
+
+    if (s[0] == '-')
+    {
+        sign = MPD_NEG;
+        pos = 3;
+    }
+
+    int digits = n - pos;
+    uint16_t rdata[digits];
+
+    for (int i = 0; i < digits; i++)
+    {
+        int c = s[pos+i] & 0xff;
+        if (isdigit(c))
+        {
+            c -= '0';
+        } else if (isalpha(c)) {
+            c -= isupper(c) ? 'A' - 10 : 'a' - 10;
+        }
+
+        rdata[digits - i - 1] = c;
+    }
+
+    uint32_t status = 0;
+    mpd_t *r = mpd_qnew();
+    mpd_qimport_u16(r, &rdata[0], digits, sign, 16, mpd_max_ctx(), &status);
+    return opa_bf_to_number(r);
+}
+
+void test_bits(void)
+{
+    // tests from https://golang.org/src/math/big/int_test.go L1193
+
+    struct and_or_xor_test
+    {
+        const char *x;
+        const char *y;
+        const char *and;
+        const char *or;
+        const char *xor;
+    };
+
+    struct and_or_xor_test tests1[] = {
+        {"0x00", "0x00", "0x00", "0x00", "0x00"},
+        {"0x00", "0x01", "0x00", "0x01", "0x01"},
+        {"0x01", "0x00", "0x00", "0x01", "0x01"},
+        {"-0x01", "0x00", "0x00", "-0x01", "-0x01"},
+        {"-0xaf", "-0x50", "-0xf0", "-0x0f", "0xe1"},
+        {"0x00", "-0x01", "0x00", "-0x01", "-0x01"},
+        {"0x01", "0x01", "0x01", "0x01", "0x00"},
+        {"-0x01", "-0x01", "-0x01", "-0x01", "0x00"},
+        {"0x07", "0x08", "0x00", "0x0f", "0x0f"},
+        {"0x05", "0x0f", "0x05", "0x0f", "0x0a"},
+        {"0xff", "-0x0a", "0xf6", "-0x01", "-0xf7"},
+        {"0x013ff6", "0x9a4e", "0x1a46", "0x01bffe", "0x01a5b8"},
+        {"-0x013ff6", "0x9a4e", "0x800a", "-0x0125b2", "-0x01a5bc"},
+        {"-0x013ff6", "-0x9a4e", "-0x01bffe", "-0x1a46", "0x01a5b8"},
+        {
+            "0x1000009dc6e3d9822cba04129bcbe3401",
+            "0xb9bd7d543685789d57cb918e833af352559021483cdb05cc21fd",
+            "0x1000001186210100001000009048c2001",
+            "0xb9bd7d543685789d57cb918e8bfeff7fddb2ebe87dfbbdfe35fd",
+            "0xb9bd7d543685789d57ca918e8ae69d6fcdb2eae87df2b97215fc",
+            },
+        {
+            "0x1000009dc6e3d9822cba04129bcbe3401",
+            "-0xb9bd7d543685789d57cb918e833af352559021483cdb05cc21fd",
+            "0x8c40c2d8822caa04120b8321401",
+            "-0xb9bd7d543685789d57ca918e82229142459020483cd2014001fd",
+            "-0xb9bd7d543685789d57ca918e8ae69d6fcdb2eae87df2b97215fe",
+        },
+        {
+            "-0x1000009dc6e3d9822cba04129bcbe3401",
+            "-0xb9bd7d543685789d57cb918e833af352559021483cdb05cc21fd",
+            "-0xb9bd7d543685789d57cb918e8bfeff7fddb2ebe87dfbbdfe35fd",
+            "-0x1000001186210100001000009048c2001",
+            "0xb9bd7d543685789d57ca918e8ae69d6fcdb2eae87df2b97215fc",
+        },
+    };
+
+    for (int i = 0; i < sizeof(tests1)/sizeof(tests1[0]); i++) {
+        test("and", opa_value_compare(number(tests1[i].and), opa_bits_and(number(tests1[i].x), number(tests1[i].y))) == 0);
+        test("or", opa_value_compare(number(tests1[i].or), opa_bits_or(number(tests1[i].x), number(tests1[i].y))) == 0);
+        test("xor", opa_value_compare(number(tests1[i].xor), opa_bits_xor(number(tests1[i].x), number(tests1[i].y))) == 0);
+    }
+
+    // tests from https://golang.org/src/math/big/int_test.go L1496
+
+    struct negate_test
+    {
+        const char *input;
+        const char *output;
+    };
+
+    struct negate_test tests2[] = {
+        {"0", "-1"},
+        {"1", "-2"},
+        {"7", "-8"},
+        {"0", "-1"},
+        {"-81910", "81909"},
+        {
+            "298472983472983471903246121093472394872319615612417471234712061",
+            "-298472983472983471903246121093472394872319615612417471234712062",
+        },
+     };
+
+     for (int i = 0; i < sizeof(tests2)/sizeof(tests2[0]); i++) {
+         test("negate", opa_value_compare(opa_number_ref(tests2[i].output, strlen(tests2[i].output)),
+                                          opa_bits_negate(opa_number_ref(tests2[i].input, strlen(tests2[i].input)))) == 0);
+         test("negate", opa_value_compare(opa_number_ref(tests2[i].input, strlen(tests2[i].input)),
+                                          opa_bits_negate(opa_number_ref(tests2[i].output, strlen(tests2[i].output)))) == 0);
+     }
+
+     // tests from https://golang.org/src/math/big/int_test.go L883
+
+     struct shift_test
+     {
+         const char *input;
+         int shift;
+         const char *output;
+     };
+
+     struct shift_test tests3[] = {
+         {"0", 0, "0"},
+         {"-0", 0, "0"},
+         {"0", 1, "0"},
+         {"0", 2, "0"},
+         {"1", 0, "1"},
+         {"1", 1, "0"},
+         {"1", 2, "0"},
+         {"2", 0, "2"},
+         {"2", 1, "1"},
+         {"-1", 0, "-1"},
+         {"-1", 1, "-1"},
+         {"-1", 10, "-1"},
+         {"-100", 2, "-25"},
+         {"-100", 3, "-13"},
+         {"-100", 100, "-1"},
+         {"4294967296", 0, "4294967296"},
+         {"4294967296", 1, "2147483648"},
+         {"4294967296", 2, "1073741824"},
+         {"18446744073709551616", 0, "18446744073709551616"},
+         {"18446744073709551616", 1, "9223372036854775808"},
+         {"18446744073709551616", 2, "4611686018427387904"},
+         {"18446744073709551616", 64, "1"},
+         {"340282366920938463463374607431768211456", 64, "18446744073709551616"},
+         {"340282366920938463463374607431768211456", 128, "1"},
+     };
+
+     for (int i = 0; i < sizeof(tests3)/sizeof(tests3[0]); i++) {
+         test("right shift", opa_value_compare(opa_number_ref(tests3[i].output, strlen(tests3[i].output)),
+                                               opa_bits_shiftright(opa_number_ref(tests3[i].input, strlen(tests3[i].input)),
+                                                                   opa_number_int(tests3[i].shift))) == 0);
+     };
+
+     // tests from https://golang.org/src/math/big/int_test.go L940
+
+     struct shift_test tests4[] = {
+         {"0", 0, "0"},
+         {"0", 1, "0"},
+         {"0", 2, "0"},
+         {"1", 0, "1"},
+         {"1", 1, "2"},
+         {"1", 2, "4"},
+         {"2", 0, "2"},
+         {"2", 1, "4"},
+         {"2", 2, "8"},
+         {"-87", 1, "-174"},
+         {"4294967296", 0, "4294967296"},
+         {"4294967296", 1, "8589934592"},
+         {"4294967296", 2, "17179869184"},
+         {"18446744073709551616", 0, "18446744073709551616"},
+         {"9223372036854775808", 1, "18446744073709551616"},
+         {"4611686018427387904", 2, "18446744073709551616"},
+         {"1", 64, "18446744073709551616"},
+         {"18446744073709551616", 64, "340282366920938463463374607431768211456"},
+         {"1", 128, "340282366920938463463374607431768211456"},
+     };
+
+     for (int i = 0; i < sizeof(tests4)/sizeof(tests4[0]); i++) {
+         test("left shift", opa_value_compare(opa_number_ref(tests4[i].output, strlen(tests4[i].output)),
+                                              opa_bits_shiftleft(opa_number_ref(tests4[i].input, strlen(tests4[i].input)),
+                                                                 opa_number_int(tests4[i].shift))) == 0);
+     };
+}
+
+void test_aggregates(void)
+{
+    opa_array_t *arr = opa_cast_array(opa_array());
+    opa_array_append(arr, opa_number_int(2));
+    opa_array_append(arr, opa_number_int(1));
+    opa_array_append(arr, opa_number_int(4));
+
+    opa_array_t *arr_sorted = opa_cast_array(opa_array());
+    opa_array_append(arr_sorted, opa_number_int(1));
+    opa_array_append(arr_sorted, opa_number_int(2));
+    opa_array_append(arr_sorted, opa_number_int(4));
+
+    opa_object_t *obj = opa_cast_object(opa_object());
+    opa_object_insert(obj, opa_string_terminated("b"), opa_number_int(2));
+    opa_object_insert(obj, opa_string_terminated("a"), opa_number_int(1));
+    opa_object_insert(obj, opa_string_terminated("c"), opa_number_int(4));
+
+    opa_set_t *set = opa_cast_set(opa_set());
+    opa_set_add(set, opa_number_int(2));
+    opa_set_add(set, opa_number_int(1));
+    opa_set_add(set, opa_number_int(4));
+
+    test("count/string", opa_value_compare(opa_agg_count(opa_string("foo", 3)), opa_number_int(3)) == 0);
+    test("count/array", opa_value_compare(opa_agg_count(&arr->hdr), opa_number_int(3)) == 0);
+    test("count/object", opa_value_compare(opa_agg_count(&obj->hdr), opa_number_int(3)) == 0);
+    test("count/set", opa_value_compare(opa_agg_count(&set->hdr), opa_number_int(3)) == 0);
+
+    test("sum/array", opa_value_compare(opa_agg_sum(&arr->hdr), opa_number_int(7)) == 0);
+    test("sum/set", opa_value_compare(opa_agg_sum(&set->hdr), opa_number_int(7)) == 0);
+
+    test("product/array", opa_value_compare(opa_agg_product(&arr->hdr), opa_number_int(8)) == 0);
+    test("product/set", opa_value_compare(opa_agg_product(&set->hdr), opa_number_int(8)) == 0);
+
+    test("max/array", opa_value_compare(opa_agg_max(&arr->hdr), opa_number_int(4)) == 0);
+    test("max/set", opa_value_compare(opa_agg_max(&set->hdr), opa_number_int(4)) == 0);
+
+    test("min/array", opa_value_compare(opa_agg_min(&arr->hdr), opa_number_int(1)) == 0);
+    test("min/set", opa_value_compare(opa_agg_min(&set->hdr), opa_number_int(1)) == 0);
+
+    test("sort/array", opa_value_compare(opa_agg_sort(&arr->hdr), &arr_sorted->hdr) == 0);
+    test("sort/set", opa_value_compare(opa_agg_sort(&set->hdr), &arr_sorted->hdr) == 0);
+
+    opa_array_t *arr_trues = opa_cast_array(opa_array());
+    opa_array_append(arr_trues, opa_boolean(TRUE));
+    opa_array_append(arr_trues, opa_boolean(TRUE));
+
+    opa_array_t *arr_mixed = opa_cast_array(opa_array());
+    opa_array_append(arr_mixed, opa_boolean(TRUE));
+    opa_array_append(arr_mixed, opa_boolean(FALSE));
+
+    opa_array_t *arr_falses = opa_cast_array(opa_array());
+    opa_array_append(arr_falses, opa_boolean(FALSE));
+    opa_array_append(arr_falses, opa_boolean(FALSE));
+
+    test("all/array trues", opa_value_compare(opa_agg_all(&arr_trues->hdr), opa_boolean(TRUE)) == 0);
+    test("all/array mixed", opa_value_compare(opa_agg_all(&arr_mixed->hdr), opa_boolean(FALSE)) == 0);
+    test("all/array falses", opa_value_compare(opa_agg_all(&arr_falses->hdr), opa_boolean(FALSE)) == 0);
+    test("any/array trues", opa_value_compare(opa_agg_any(&arr_trues->hdr), opa_boolean(TRUE)) == 0);
+    test("any/array mixed", opa_value_compare(opa_agg_any(&arr_mixed->hdr), opa_boolean(TRUE)) == 0);
+    test("any/array falses", opa_value_compare(opa_agg_any(&arr_falses->hdr), opa_boolean(FALSE)) == 0);
+
+    opa_set_t *set_trues = opa_cast_set(opa_set());
+    opa_set_add(set_trues, opa_boolean(TRUE));
+    opa_set_add(set_trues, opa_boolean(TRUE));
+
+    opa_set_t *set_mixed = opa_cast_set(opa_set());
+    opa_set_add(set_mixed, opa_boolean(TRUE));
+    opa_set_add(set_mixed, opa_boolean(FALSE));
+
+    opa_set_t *set_falses = opa_cast_set(opa_set());
+    opa_set_add(set_falses, opa_boolean(FALSE));
+    opa_set_add(set_falses, opa_boolean(FALSE));
+
+    test("all/set trues", opa_value_compare(opa_agg_all(&set_trues->hdr), opa_boolean(TRUE)) == 0);
+    test("all/set mixed", opa_value_compare(opa_agg_all(&set_mixed->hdr), opa_boolean(FALSE)) == 0);
+    test("all/set falses", opa_value_compare(opa_agg_all(&set_falses->hdr), opa_boolean(FALSE)) == 0);
+    test("any/set trues", opa_value_compare(opa_agg_any(&set_trues->hdr), opa_boolean(TRUE)) == 0);
+    test("any/set mixed", opa_value_compare(opa_agg_any(&set_mixed->hdr), opa_boolean(TRUE)) == 0);
+    test("any/set falses", opa_value_compare(opa_agg_any(&set_falses->hdr), opa_boolean(FALSE)) == 0);
+}
+
+void test_strings(void)
+{
+    opa_value *join = opa_string_terminated("--");
+
+    opa_array_t *arr0 = opa_cast_array(opa_array());
+
+    opa_array_t *arr1 = opa_cast_array(opa_array());
+    opa_array_append(arr1, opa_string_terminated("foo"));
+
+    opa_array_t *arr2 = opa_cast_array(opa_array());
+    opa_array_append(arr2, opa_string_terminated("foo"));
+    opa_array_append(arr2, opa_string_terminated("bar"));
+
+    opa_set_t *set0 = opa_cast_set(opa_set());
+
+    opa_set_t *set1 = opa_cast_set(opa_set());
+    opa_set_add(set1, opa_string_terminated("foo"));
+
+    opa_set_t *set2 = opa_cast_set(opa_set());
+    opa_set_add(set2, opa_string_terminated("foo"));
+    opa_set_add(set2, opa_string_terminated("bar"));
+
+    test("concat/array0", opa_value_compare(opa_strings_concat(join, &arr0->hdr), opa_string_terminated("")) == 0);
+    test("concat/array1", opa_value_compare(opa_strings_concat(join, &arr1->hdr), opa_string_terminated("foo")) == 0);
+    test("concat/array2", opa_value_compare(opa_strings_concat(join, &arr2->hdr), opa_string_terminated("foo--bar")) == 0);
+    test("concat/set0", opa_value_compare(opa_strings_concat(join, &set0->hdr), opa_string_terminated("")) == 0);
+    test("concat/set1", opa_value_compare(opa_strings_concat(join, &set1->hdr), opa_string_terminated("foo")) == 0);
+    test("concat/set2", opa_value_compare(opa_strings_concat(join, &set2->hdr), opa_string_terminated("bar--foo")) == 0);
+
+    test("contains/__", opa_value_compare(opa_strings_contains(opa_string_terminated(""), opa_string_terminated("")), opa_boolean(TRUE)) == 0);
+    test("contains/_a", opa_value_compare(opa_strings_contains(opa_string_terminated(""), opa_string_terminated("a")), opa_boolean(FALSE)) == 0);
+    test("contains/a_", opa_value_compare(opa_strings_contains(opa_string_terminated("a"), opa_string_terminated("")), opa_boolean(TRUE)) == 0);
+    test("contains/aa", opa_value_compare(opa_strings_contains(opa_string_terminated("a"), opa_string_terminated("a")), opa_boolean(TRUE)) == 0);
+    test("contains/ab", opa_value_compare(opa_strings_contains(opa_string_terminated("a"), opa_string_terminated("b")), opa_boolean(FALSE)) == 0);
+    test("contains/aab", opa_value_compare(opa_strings_contains(opa_string_terminated("a"), opa_string_terminated("ab")), opa_boolean(FALSE)) == 0);
+    test("contains/abb", opa_value_compare(opa_strings_contains(opa_string_terminated("ab"), opa_string_terminated("b")), opa_boolean(TRUE)) == 0);
+    test("contains/aab", opa_value_compare(opa_strings_contains(opa_string_terminated("aa"), opa_string_terminated("b")), opa_boolean(FALSE)) == 0);
+    test("contains/abab", opa_value_compare(opa_strings_contains(opa_string_terminated("ab"), opa_string_terminated("ab")), opa_boolean(TRUE)) == 0);
+    test("contains/abaa", opa_value_compare(opa_strings_contains(opa_string_terminated("ab"), opa_string_terminated("aa")), opa_boolean(FALSE)) == 0);
+    test("contains/abcbc", opa_value_compare(opa_strings_contains(opa_string_terminated("abc"), opa_string_terminated("bc")), opa_boolean(TRUE)) == 0);
+    test("contains/abcbd", opa_value_compare(opa_strings_contains(opa_string_terminated("abc"), opa_string_terminated("bd")), opa_boolean(FALSE)) == 0);
+
+    test("endswith/__", opa_value_compare(opa_strings_endswith(opa_string_terminated(""), opa_string_terminated("")), opa_boolean(TRUE)) == 0);
+    test("endswith/_a", opa_value_compare(opa_strings_endswith(opa_string_terminated(""), opa_string_terminated("a")), opa_boolean(FALSE)) == 0);
+    test("endswith/a_", opa_value_compare(opa_strings_endswith(opa_string_terminated("a"), opa_string_terminated("")), opa_boolean(TRUE)) == 0);
+    test("endswith/aa", opa_value_compare(opa_strings_endswith(opa_string_terminated("a"), opa_string_terminated("a")), opa_boolean(TRUE)) == 0);
+    test("endswith/ab", opa_value_compare(opa_strings_endswith(opa_string_terminated("a"), opa_string_terminated("b")), opa_boolean(FALSE)) == 0);
+    test("endswith/aab", opa_value_compare(opa_strings_endswith(opa_string_terminated("a"), opa_string_terminated("ab")), opa_boolean(FALSE)) == 0);
+    test("endswith/abb", opa_value_compare(opa_strings_endswith(opa_string_terminated("ab"), opa_string_terminated("b")), opa_boolean(TRUE)) == 0);
+    test("endswith/aab", opa_value_compare(opa_strings_endswith(opa_string_terminated("aa"), opa_string_terminated("b")), opa_boolean(FALSE)) == 0);
+    test("endswith/abab", opa_value_compare(opa_strings_endswith(opa_string_terminated("ab"), opa_string_terminated("ab")), opa_boolean(TRUE)) == 0);
+    test("endswith/abaa", opa_value_compare(opa_strings_endswith(opa_string_terminated("ab"), opa_string_terminated("aa")), opa_boolean(FALSE)) == 0);
+    test("endswith/abcbc", opa_value_compare(opa_strings_endswith(opa_string_terminated("abc"), opa_string_terminated("bc")), opa_boolean(TRUE)) == 0);
+    test("endswith/abcbd", opa_value_compare(opa_strings_endswith(opa_string_terminated("abc"), opa_string_terminated("bd")), opa_boolean(FALSE)) == 0);
+
+    test("format_int/2_0", opa_value_compare(opa_strings_format_int(opa_number_float(0), opa_number_int(2)), opa_string_terminated("0")) == 0);
+    test("format_int/2_1", opa_value_compare(opa_strings_format_int(opa_number_float(1), opa_number_int(2)), opa_string_terminated("1")) == 0);
+    test("format_int/2_-1", opa_value_compare(opa_strings_format_int(opa_number_float(-1), opa_number_int(2)), opa_string_terminated("-1")) == 0);
+    test("format_int/2_2", opa_value_compare(opa_strings_format_int(opa_number_float(2), opa_number_int(2)), opa_string_terminated("10")) == 0);
+    test("format_int/2_7", opa_value_compare(opa_strings_format_int(opa_number_float(7), opa_number_int(2)), opa_string_terminated("111")) == 0);
+    test("format_int/8_0", opa_value_compare(opa_strings_format_int(opa_number_float(0), opa_number_int(8)), opa_string_terminated("0")) == 0);
+    test("format_int/8_1", opa_value_compare(opa_strings_format_int(opa_number_float(1), opa_number_int(8)), opa_string_terminated("1")) == 0);
+    test("format_int/8_-1", opa_value_compare(opa_strings_format_int(opa_number_float(-1), opa_number_int(8)), opa_string_terminated("-1")) == 0);
+    test("format_int/8_8", opa_value_compare(opa_strings_format_int(opa_number_float(8), opa_number_int(8)), opa_string_terminated("10")) == 0);
+    test("format_int/8_9", opa_value_compare(opa_strings_format_int(opa_number_float(9), opa_number_int(8)), opa_string_terminated("11")) == 0);
+    test("format_int/10_0", opa_value_compare(opa_strings_format_int(opa_number_float(0), opa_number_int(10)), opa_string_terminated("0")) == 0);
+    test("format_int/10_1", opa_value_compare(opa_strings_format_int(opa_number_float(1), opa_number_int(10)), opa_string_terminated("1")) == 0);
+    test("format_int/10_-1", opa_value_compare(opa_strings_format_int(opa_number_float(-1), opa_number_int(10)), opa_string_terminated("-1")) == 0);
+    test("format_int/10_10", opa_value_compare(opa_strings_format_int(opa_number_float(10), opa_number_int(10)), opa_string_terminated("10")) == 0);
+    test("format_int/10_11", opa_value_compare(opa_strings_format_int(opa_number_float(11), opa_number_int(10)), opa_string_terminated("11")) == 0);
+    test("format_int/16_0", opa_value_compare(opa_strings_format_int(opa_number_float(0), opa_number_int(16)), opa_string_terminated("0")) == 0);
+    test("format_int/16_1", opa_value_compare(opa_strings_format_int(opa_number_float(1), opa_number_int(16)), opa_string_terminated("1")) == 0);
+    test("format_int/16_-1", opa_value_compare(opa_strings_format_int(opa_number_float(-1), opa_number_int(16)), opa_string_terminated("-1")) == 0);
+    test("format_int/16_16", opa_value_compare(opa_strings_format_int(opa_number_float(16), opa_number_int(16)), opa_string_terminated("10")) == 0);
+    test("format_int/16_31", opa_value_compare(opa_strings_format_int(opa_number_float(31), opa_number_int(16)), opa_string_terminated("1f")) == 0);
+
+    test("indexof/__", opa_value_compare(opa_strings_indexof(opa_string_terminated(""), opa_string_terminated("")), opa_number_int(0)) == 0);
+    test("indexof/_a", opa_value_compare(opa_strings_indexof(opa_string_terminated(""), opa_string_terminated("a")), opa_number_int(-1)) == 0);
+    test("indexof/a_", opa_value_compare(opa_strings_indexof(opa_string_terminated("a"), opa_string_terminated("")), opa_number_int(0)) == 0);
+    test("indexof/aa", opa_value_compare(opa_strings_indexof(opa_string_terminated("a"), opa_string_terminated("a")), opa_number_int(0)) == 0);
+    test("indexof/ab", opa_value_compare(opa_strings_indexof(opa_string_terminated("a"), opa_string_terminated("b")), opa_number_int(-1)) == 0);
+    test("indexof/aab", opa_value_compare(opa_strings_indexof(opa_string_terminated("a"), opa_string_terminated("ab")), opa_number_int(-1)) == 0);
+    test("indexof/abb", opa_value_compare(opa_strings_indexof(opa_string_terminated("ab"), opa_string_terminated("b")), opa_number_int(1)) == 0);
+    test("indexof/aab", opa_value_compare(opa_strings_indexof(opa_string_terminated("aa"), opa_string_terminated("b")), opa_number_int(-1)) == 0);
+    test("indexof/abab", opa_value_compare(opa_strings_indexof(opa_string_terminated("ab"), opa_string_terminated("ab")), opa_number_int(0)) == 0);
+    test("indexof/abaa", opa_value_compare(opa_strings_indexof(opa_string_terminated("ab"), opa_string_terminated("aa")), opa_number_int(-1)) == 0);
+    test("indexof/abcbc", opa_value_compare(opa_strings_indexof(opa_string_terminated("abc"), opa_string_terminated("bc")), opa_number_int(1)) == 0);
+    test("indexof/abcbd", opa_value_compare(opa_strings_indexof(opa_string_terminated("abc"), opa_string_terminated("bd")), opa_number_int(-1)) == 0);
+
+    test("replace/___", opa_value_compare(opa_strings_replace(opa_string_terminated(""), opa_string_terminated(""), opa_string_terminated("")), opa_string_terminated("")) == 0);
+    test("replace/_ab", opa_value_compare(opa_strings_replace(opa_string_terminated(""), opa_string_terminated("a"), opa_string_terminated("b")), opa_string_terminated("")) == 0);
+    test("replace/aab", opa_value_compare(opa_strings_replace(opa_string_terminated("a"), opa_string_terminated("a"), opa_string_terminated("b")), opa_string_terminated("b")) == 0);
+    test("replace/cab", opa_value_compare(opa_strings_replace(opa_string_terminated("c"), opa_string_terminated("a"), opa_string_terminated("b")), opa_string_terminated("c")) == 0);
+    test("replace/aaab", opa_value_compare(opa_strings_replace(opa_string_terminated("aa"), opa_string_terminated("a"), opa_string_terminated("b")), opa_string_terminated("bb")) == 0);
+    test("replace/acaab", opa_value_compare(opa_strings_replace(opa_string_terminated("aca"), opa_string_terminated("a"), opa_string_terminated("b")), opa_string_terminated("bcb")) == 0);
+    test("replace/acaabd", opa_value_compare(opa_strings_replace(opa_string_terminated("aca"), opa_string_terminated("a"), opa_string_terminated("bd")), opa_string_terminated("bdcbd")) == 0);
+    test("replace/cacab", opa_value_compare(opa_strings_replace(opa_string_terminated("cac"), opa_string_terminated("a"), opa_string_terminated("b")), opa_string_terminated("cbc")) == 0);
+    test("replace/cacabd", opa_value_compare(opa_strings_replace(opa_string_terminated("cac"), opa_string_terminated("a"), opa_string_terminated("bd")), opa_string_terminated("cbdc")) == 0);
+
+    opa_object_t *obj2 = opa_cast_object(opa_object());
+    opa_object_insert(obj2, opa_string_terminated("a"), opa_string_terminated("b"));
+    opa_object_insert(obj2, opa_string_terminated("c"), opa_string_terminated("d"));
+
+    test("replace_n/empty", opa_value_compare(opa_strings_replace_n(opa_object(), opa_string_terminated("a")), opa_string_terminated("a")) == 0);
+    test("replace_n/two", opa_value_compare(opa_strings_replace_n(&obj2->hdr, opa_string_terminated("ac")), opa_string_terminated("bd")) == 0);
+
+    opa_array_t *arr2b = opa_cast_array(opa_array());
+    opa_array_append(arr2b, opa_string_terminated(""));
+    opa_array_append(arr2b, opa_string_terminated("foo"));
+
+    opa_array_t *arr2c = opa_cast_array(opa_array());
+    opa_array_append(arr2c, opa_string_terminated("foo"));
+    opa_array_append(arr2c, opa_string_terminated(""));
+
+    opa_array_t *arr3 = opa_cast_array(opa_array());
+    opa_array_append(arr3, opa_string_terminated("foo"));
+    opa_array_append(arr3, opa_string_terminated("bar"));
+    opa_array_append(arr3, opa_string_terminated("baz"));
+
+    test("split/one", opa_value_compare(opa_strings_split(opa_string_terminated("foo"), opa_string_terminated(",")), &arr1->hdr) == 0);
+    test("split/two_a", opa_value_compare(opa_strings_split(opa_string_terminated("foo,bar"), opa_string_terminated(",")), &arr2->hdr) == 0);
+    test("split/two_b", opa_value_compare(opa_strings_split(opa_string_terminated(",,foo"), opa_string_terminated(",,")), &arr2b->hdr) == 0);
+    test("split/two_c", opa_value_compare(opa_strings_split(opa_string_terminated("foo,,"), opa_string_terminated(",,")), &arr2c->hdr) == 0);
+    test("split/three", opa_value_compare(opa_strings_split(opa_string_terminated("foo,,bar,,baz"), opa_string_terminated(",,")), &arr3->hdr) == 0);
+
+    opa_array_t *arr4 = opa_cast_array(opa_array());
+    opa_array_append(arr4, opa_string_terminated("f"));
+    opa_array_append(arr4, opa_string_terminated("o"));
+    opa_array_append(arr4, opa_string_terminated("o"));
+
+    opa_array_t *arr5 = opa_cast_array(opa_array());
+    opa_array_append(arr5, opa_string_terminated("f"));
+    opa_array_append(arr5, opa_string_terminated("\xE2\x82\xAC")); // euro symbol
+    opa_array_append(arr5, opa_string_terminated("o"));
+
+    test("split/ascii", opa_value_compare(opa_strings_split(opa_string_terminated("foo"), opa_string_terminated("")), &arr4->hdr) == 0);
+    test("split/utf8", opa_value_compare(opa_strings_split(opa_string_terminated("f\xE2\x82\xACo"), opa_string_terminated("")), &arr5->hdr) == 0);
+
+    test("startswith/__", opa_value_compare(opa_strings_startswith(opa_string_terminated(""), opa_string_terminated("")), opa_boolean(TRUE)) == 0);
+    test("startswith/_a", opa_value_compare(opa_strings_startswith(opa_string_terminated(""), opa_string_terminated("a")), opa_boolean(FALSE)) == 0);
+    test("startswith/a_", opa_value_compare(opa_strings_startswith(opa_string_terminated("a"), opa_string_terminated("")), opa_boolean(TRUE)) == 0);
+    test("startswith/aa", opa_value_compare(opa_strings_startswith(opa_string_terminated("a"), opa_string_terminated("a")), opa_boolean(TRUE)) == 0);
+    test("startswith/ab", opa_value_compare(opa_strings_startswith(opa_string_terminated("a"), opa_string_terminated("b")), opa_boolean(FALSE)) == 0);
+    test("startswith/aab", opa_value_compare(opa_strings_startswith(opa_string_terminated("a"), opa_string_terminated("ab")), opa_boolean(FALSE)) == 0);
+    test("startswith/aba", opa_value_compare(opa_strings_startswith(opa_string_terminated("ab"), opa_string_terminated("a")), opa_boolean(TRUE)) == 0);
+    test("startswith/aab", opa_value_compare(opa_strings_startswith(opa_string_terminated("aa"), opa_string_terminated("b")), opa_boolean(FALSE)) == 0);
+    test("startswith/abab", opa_value_compare(opa_strings_startswith(opa_string_terminated("ab"), opa_string_terminated("ab")), opa_boolean(TRUE)) == 0);
+    test("startswith/abaa", opa_value_compare(opa_strings_startswith(opa_string_terminated("ab"), opa_string_terminated("aa")), opa_boolean(FALSE)) == 0);
+    test("startswith/abcab", opa_value_compare(opa_strings_startswith(opa_string_terminated("abc"), opa_string_terminated("ab")), opa_boolean(TRUE)) == 0);
+    test("startswith/abcac", opa_value_compare(opa_strings_startswith(opa_string_terminated("abc"), opa_string_terminated("ac")), opa_boolean(FALSE)) == 0);
+
+    test("substring/_00", opa_value_compare(opa_strings_substring(opa_string_terminated(""), opa_number_int(0), opa_number_int(0)), opa_string_terminated("")) == 0);
+    test("substring/_0-1", opa_value_compare(opa_strings_substring(opa_string_terminated(""), opa_number_int(0), opa_number_int(-1)), opa_string_terminated("")) == 0);
+    test("substring/_10", opa_value_compare(opa_strings_substring(opa_string_terminated(""), opa_number_int(1), opa_number_int(0)), opa_string_terminated("")) == 0);
+    test("substring/_1-1", opa_value_compare(opa_strings_substring(opa_string_terminated(""), opa_number_int(1), opa_number_int(-1)), opa_string_terminated("")) == 0);
+    test("substring/abc1-1", opa_value_compare(opa_strings_substring(opa_string_terminated("abc"), opa_number_int(1), opa_number_int(-1)), opa_string_terminated("bc")) == 0);
+    test("substring/abc10", opa_value_compare(opa_strings_substring(opa_string_terminated("abc"), opa_number_int(1), opa_number_int(0)), opa_string_terminated("")) == 0);
+    test("substring/abc11", opa_value_compare(opa_strings_substring(opa_string_terminated("abc"), opa_number_int(1), opa_number_int(1)), opa_string_terminated("b")) == 0);
+    test("substring/abc12", opa_value_compare(opa_strings_substring(opa_string_terminated("abc"), opa_number_int(1), opa_number_int(2)), opa_string_terminated("bc")) == 0);
+
+    test("trim/__", opa_value_compare(opa_strings_trim(opa_string_terminated(""), opa_string_terminated("")), opa_string_terminated("")) == 0);
+    test("trim/abcba", opa_value_compare(opa_strings_trim(opa_string_terminated("abc"), opa_string_terminated("ba")), opa_string_terminated("c")) == 0);
+
+    test("trim_left/__", opa_value_compare(opa_strings_trim_left(opa_string_terminated(""), opa_string_terminated("")), opa_string_terminated("")) == 0);
+    test("trim_left/_a", opa_value_compare(opa_strings_trim_left(opa_string_terminated(""), opa_string_terminated("a")), opa_string_terminated("")) == 0);
+    test("trim_left/a_", opa_value_compare(opa_strings_trim_left(opa_string_terminated("a"), opa_string_terminated("")), opa_string_terminated("a")) == 0);
+    test("trim_left/aa", opa_value_compare(opa_strings_trim_left(opa_string_terminated("a"), opa_string_terminated("a")), opa_string_terminated("")) == 0);
+    test("trim_left/ab", opa_value_compare(opa_strings_trim_left(opa_string_terminated("a"), opa_string_terminated("b")), opa_string_terminated("a")) == 0);
+    test("trim_left/aba", opa_value_compare(opa_strings_trim_left(opa_string_terminated("ab"), opa_string_terminated("a")), opa_string_terminated("b")) == 0);
+    test("trim_left/abcba", opa_value_compare(opa_strings_trim_left(opa_string_terminated("abc"), opa_string_terminated("ba")), opa_string_terminated("c")) == 0);
+    test("trim_left/aeuro dceuro ", opa_value_compare(opa_strings_trim_left(opa_string_terminated("a\xE2\x82\xAC d"), opa_string_terminated("ca\xE2\x82\xAC ")), opa_string_terminated("d")) == 0);
+
+    test("trim_prefix/__", opa_value_compare(opa_strings_trim_prefix(opa_string_terminated(""), opa_string_terminated("")), opa_string_terminated("")) == 0);
+    test("trim_prefix/_a", opa_value_compare(opa_strings_trim_prefix(opa_string_terminated(""), opa_string_terminated("a")), opa_string_terminated("")) == 0);
+    test("trim_prefix/a_", opa_value_compare(opa_strings_trim_prefix(opa_string_terminated("a"), opa_string_terminated("")), opa_string_terminated("a")) == 0);
+    test("trim_prefix/aa", opa_value_compare(opa_strings_trim_prefix(opa_string_terminated("a"), opa_string_terminated("a")), opa_string_terminated("")) == 0);
+    test("trim_prefix/ab", opa_value_compare(opa_strings_trim_prefix(opa_string_terminated("a"), opa_string_terminated("b")), opa_string_terminated("a")) == 0);
+    test("trim_prefix/aba", opa_value_compare(opa_strings_trim_prefix(opa_string_terminated("ab"), opa_string_terminated("a")), opa_string_terminated("b")) == 0);
+
+    test("trim_right/__", opa_value_compare(opa_strings_trim_right(opa_string_terminated(""), opa_string_terminated("")), opa_string_terminated("")) == 0);
+    test("trim_right/_a", opa_value_compare(opa_strings_trim_right(opa_string_terminated(""), opa_string_terminated("a")), opa_string_terminated("")) == 0);
+    test("trim_right/a_", opa_value_compare(opa_strings_trim_right(opa_string_terminated("a"), opa_string_terminated("")), opa_string_terminated("a")) == 0);
+    test("trim_right/aa", opa_value_compare(opa_strings_trim_right(opa_string_terminated("a"), opa_string_terminated("a")), opa_string_terminated("")) == 0);
+    test("trim_right/ab", opa_value_compare(opa_strings_trim_right(opa_string_terminated("a"), opa_string_terminated("b")), opa_string_terminated("a")) == 0);
+    test("trim_right/abb", opa_value_compare(opa_strings_trim_right(opa_string_terminated("ab"), opa_string_terminated("b")), opa_string_terminated("a")) == 0);
+    test("trim_right/abccb", opa_value_compare(opa_strings_trim_right(opa_string_terminated("abc"), opa_string_terminated("cb")), opa_string_terminated("a")) == 0);
+    test("trim_right/daeuro ceuro ", opa_value_compare(opa_strings_trim_right(opa_string_terminated("da\xE2\x82\xAC "), opa_string_terminated("ca\xE2\x82\xAC ")), opa_string_terminated("d")) == 0);
+
+    test("trim_suffix/__", opa_value_compare(opa_strings_trim_suffix(opa_string_terminated(""), opa_string_terminated("")), opa_string_terminated("")) == 0);
+    test("trim_suffix/_a", opa_value_compare(opa_strings_trim_suffix(opa_string_terminated(""), opa_string_terminated("a")), opa_string_terminated("")) == 0);
+    test("trim_suffix/a_", opa_value_compare(opa_strings_trim_suffix(opa_string_terminated("a"), opa_string_terminated("")), opa_string_terminated("a")) == 0);
+    test("trim_suffix/aa", opa_value_compare(opa_strings_trim_suffix(opa_string_terminated("a"), opa_string_terminated("a")), opa_string_terminated("")) == 0);
+    test("trim_suffix/ab", opa_value_compare(opa_strings_trim_suffix(opa_string_terminated("a"), opa_string_terminated("b")), opa_string_terminated("a")) == 0);
+    test("trim_suffix/abb", opa_value_compare(opa_strings_trim_suffix(opa_string_terminated("ab"), opa_string_terminated("b")), opa_string_terminated("a")) == 0);
+
+    test("trim_space/_", opa_value_compare(opa_strings_trim_space(opa_string_terminated("")), opa_string_terminated("")) == 0);
+    test("trim_space/a", opa_value_compare(opa_strings_trim_space(opa_string_terminated("a")), opa_string_terminated("a")) == 0);
+    test("trim_space/_a", opa_value_compare(opa_strings_trim_space(opa_string_terminated(" a")), opa_string_terminated("a")) == 0);
+    test("trim_space/a_", opa_value_compare(opa_strings_trim_space(opa_string_terminated("a ")), opa_string_terminated("a")) == 0);
+    test("trim_space/_a_", opa_value_compare(opa_strings_trim_space(opa_string_terminated(" a ")), opa_string_terminated("a")) == 0);
+    test("trim_space/______a_b_c______", opa_value_compare(opa_strings_trim_space(opa_string_terminated("\t\n\v\f\r a b c \r\f\v\n\t")), opa_string_terminated("a b c")) == 0);
+    test("trim_space/euro", opa_value_compare(opa_strings_trim_space(opa_string_terminated("\xE2\x82\xAC")), opa_string_terminated("\xE2\x82\xAC")) == 0);
+    test("trim_space/_euro_", opa_value_compare(opa_strings_trim_space(opa_string_terminated(" \xE2\x82\xAC ")), opa_string_terminated("\xE2\x82\xAC")) == 0);
+    test("trim_space/a_euro_", opa_value_compare(opa_strings_trim_space(opa_string_terminated("a \xE2\x82\xAC ")), opa_string_terminated("a \xE2\x82\xAC")) == 0);
+    test("trim_space/_euro_a", opa_value_compare(opa_strings_trim_space(opa_string_terminated(" \xE2\x82\xAC a")), opa_string_terminated("\xE2\x82\xAC a")) == 0);
+    test("trim_space/ogham_a", opa_value_compare(opa_strings_trim_space(opa_string_terminated("\xe1\x9a\x80 a")), opa_string_terminated("a")) == 0);
+    test("trim_space/oghamenspace_a", opa_value_compare(opa_strings_trim_space(opa_string_terminated("\xe1\x9a\x80\xe2\x80\x82 a")), opa_string_terminated("a")) == 0);
+    test("trim_space/a_oghamenspace_a", opa_value_compare(opa_strings_trim_space(opa_string_terminated("a \xe1\x9a\x80\xe2\x80\x82")), opa_string_terminated("a")) == 0);
+
+    test("lower/_", opa_value_compare(opa_strings_lower(opa_string_terminated("")), opa_string_terminated("")) == 0);
+    test("lower/a", opa_value_compare(opa_strings_lower(opa_string_terminated("a")), opa_string_terminated("a")) == 0);
+    test("lower/A", opa_value_compare(opa_strings_lower(opa_string_terminated("A")), opa_string_terminated("a")) == 0);
+    test("lower/AbCd", opa_value_compare(opa_strings_lower(opa_string_terminated("AbCd")), opa_string_terminated("abcd")) == 0);
+    test("lower/utf-8", opa_value_compare(opa_strings_lower(opa_string_terminated("\xc4\x80")), opa_string_terminated("\xc4\x81")) == 0);
+    test("lower/utf-8", opa_value_compare(opa_strings_lower(opa_string_terminated("\xc9\x83")), opa_string_terminated("\xc6\x80")) == 0);
+
+    test("upper/_", opa_value_compare(opa_strings_upper(opa_string_terminated("")), opa_string_terminated("")) == 0);
+    test("upper/a", opa_value_compare(opa_strings_upper(opa_string_terminated("a")), opa_string_terminated("A")) == 0);
+    test("upper/A", opa_value_compare(opa_strings_upper(opa_string_terminated("A")), opa_string_terminated("A")) == 0);
+    test("upper/AbCd", opa_value_compare(opa_strings_upper(opa_string_terminated("AbCd")), opa_string_terminated("ABCD")) == 0);
+    test("upper/utf-8", opa_value_compare(opa_strings_upper(opa_string_terminated("\xc4\x81")), opa_string_terminated("\xc4\x80")) == 0);
+    test("upper/utf-8", opa_value_compare(opa_strings_upper(opa_string_terminated("\xc6\x80")), opa_string_terminated("\xc9\x83")) == 0);
 }
